@@ -81,14 +81,14 @@ DOC_INSPECT = {
             "name": "Background",
             "kind": "raster",
             "blend": "Normal",
-            "opacity": 100,
+            "opacity": 1.0,
         },
         {
             "id": 1,
             "name": "copy",
             "kind": "raster",
             "blend": "Screen",
-            "opacity": 80,
+            "opacity": 0.8,
         },
     ],
     "history": [{"name": "open"}, {"name": "rotate"}, {"name": "blur"}],
@@ -976,7 +976,9 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
             observed = next(e for e in events if e["type"] == "observe")
             assert observed["observation"]["kind"] == "live"
             assert observed["observation"]["app"] == "photocraft"
-            assert observed["observation"]["detail"] == {
+            detail = observed["observation"]["detail"]
+            assert detail["layer_tree"][0]["id"] == 0
+            assert {k: v for k, v in detail.items() if k != "layer_tree"} == {
                 "width": 48,
                 "height": 32,
                 "layers": 2,

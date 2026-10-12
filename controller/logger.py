@@ -43,6 +43,8 @@ SAFE_FIELDS = frozenset(
         "model",
         "team",
         "latency_ms",
+        "call_id",
+        "outcome",
     }
 )
 
@@ -88,6 +90,17 @@ def get_logger(name: str = OPERATIONAL_LOGGER) -> logging.Logger:
     :returns: A stdlib logger (callers configure handlers; never added here).
     """
     return logging.getLogger(name)
+
+
+def configure_operational_logging() -> None:
+    """Enable redacted controller events in the local server's stderr log."""
+    logger = get_logger()
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = True
 
 
 def get_audit_logger() -> logging.Logger:

@@ -26,6 +26,8 @@ SW-REQ: SW-REQ-STREAM (agent edit loop, TC-B controller side).
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -35,6 +37,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .app_skills import app_skill
 from .commands import CommandCatalog
 from .documents import (
     DocumentError,
@@ -173,6 +176,7 @@ def brain_from_profile(
     team: dict[str, Any] | None = None,
     live: bool = False,
     live_app: str = "",
+    history: list[dict[str, Any]] | None = None,
 ) -> tuple[BrainFn, str, bool]:
     """Build a planner function from a settings profile (or MockBrain).
 
@@ -214,6 +218,9 @@ def brain_from_profile(
         default_model=model_name,
     )
 
+    messages: list[dict[str, Any]] = []
+    images: list[dict[str, Any]] = []
+
     def _plan(message: str, kind: str) -> LlmPlan:
         if live:
             system = (
@@ -222,7 +229,8 @@ def brain_from_profile(
                 "you run is applied to the document the user sees in the open "
                 "window — the effect is visible there immediately. Follow this "
                 "workflow on every request: 1) understand what the user wants "
-                "changed; 2) call command_list with short keywords (e.g. 'blend', "
+                "changed; 2) use the loaded app skill for known operations; "
+                "for unfamiliar operations call command_list with short keywords (e.g. 'blend', "
                 "'duplicate', 'opacity', 'filter') to discover the exact command "
                 "ids and their params — the registry contains everything the app "
                 "can do: layers (duplicate, move, merge), blend modes (Multiply, "
@@ -248,14 +256,41 @@ def brain_from_profile(
             )
         if context:
             system += f" {context}"
-        return client.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": message},
-            ],
+        if not messages:
+            skill = app_skill(live_app) if live else ""
+            messages.append({"role": "system", "content": system + "\n" + skill})
+            for entry in (history or [])[-12:]:
+                if entry.get("role") in {"user", "assistant"}:
+                    messages.append({"role": entry["role"], "content": entry.get("text", "")})
+        messages.extend(images)
+        images.clear()
+        messages.append({"role": "user", "content": message})
+        plan = client.chat(
+            list(messages),
             tools=LIVE_APP_TOOLS if live else AGENT_TOOLS,
             model=model_name,
         )
+        assistant: dict[str, Any] = {"role": "assistant", "content": plan.text or None}
+        if plan.tool_calls:
+            assistant["tool_calls"] = [
+                {"id": c.call_id, "type": "function", "function": {
+                    "name": c.name, "arguments": json.dumps(c.arguments)}}
+                for c in plan.tool_calls
+            ]
+        messages.append(assistant)
+        return plan
+
+    def _result(call: ToolCall, evidence: dict[str, Any], ok: bool, error: str) -> None:
+        data = {k: v for k, v in evidence.items() if k != "image_url"}
+        messages.append({"role": "tool", "tool_call_id": call.call_id,
+                         "content": json.dumps({"ok": ok, "error": error, "result": data}, default=str)})
+        if evidence.get("image_url"):
+            images.append({"role": "user", "content": [
+                {"type": "text", "text": "Live app window screenshot. Locate the canvas; coordinates for edits must be document pixels, not window pixels. If mapping is ambiguous, request clarification."},
+                {"type": "image_url", "image_url": {"url": evidence["image_url"]}},
+            ]})
+
+    _plan.tool_result = _result  # type: ignore[attr-defined]
 
     return (_plan, client.model, False)
 
@@ -333,7 +368,11 @@ async def run_agent_loop(
     pdfs = PdfAdapter(registry)
 
     try:
-        plan = plan_fn(message, doc_kind)
+        initial = await _observe_live(executor) if executor is not None and not is_mock else None
+        request = message
+        if initial is not None and not is_mock:
+            request += "\nInitial live document state: " + json.dumps(initial)
+        plan = await asyncio.to_thread(plan_fn, request, doc_kind)
     except LlmError as exc:
         log.warning(
             "agent plan failed: %s",
@@ -373,9 +412,13 @@ async def run_agent_loop(
     last_call_key: tuple[str, str] = ("", "")
     same_call_streak = 0
     step_summaries: list[str] = []
-    prev_observation: dict[str, Any] | None = None
+    prev_observation: dict[str, Any] | None = initial
     mutation_effects: dict[tuple[str, str], bool] = {}
     last_look_hash: str | None = None
+    discovery_keys: set[tuple[str, str]] = set()
+    stalled_reads = 0
+    outcome = "succeeded"
+    correction_attempts = 0
     while iteration < max_iterations:
         if not pending:
             break
@@ -393,6 +436,7 @@ async def run_agent_loop(
                 run_id=run.run_id,
                 tool=call.name,
                 iteration=iteration,
+                call_id=call.call_id,
                 ok=True,
             ),
         )
@@ -474,6 +518,9 @@ async def run_agent_loop(
                     None if last_look_hash is None else shot_hash != last_look_hash
                 )
                 last_look_hash = shot_hash
+        receive_result = getattr(plan_fn, "tool_result", None)
+        if receive_result is not None:
+            receive_result(call, evidence, ok, error)
         yield {
             "type": "tool.result",
             "name": call.name,
@@ -510,6 +557,7 @@ async def run_agent_loop(
             }
             break
         if not ok:
+            outcome = "failed"
             # Reason about the failure: record it, then stop (no blind retry).
             run.record(
                 f"tool {call.name} failed: {error}",
@@ -521,6 +569,25 @@ async def run_agent_loop(
                 "record_id": run.ledger[-1].record_id,
                 "confidence": "inferred",
             }
+            if receive_result is not None and not (already_applied or repeated_edit) and correction_attempts < 2:
+                correction_attempts += 1
+                try:
+                    correction = await asyncio.to_thread(
+                        plan_fn,
+                        f"The last tool failed: {error}. Original request: {message}. "
+                        "Use the retained tool result and app guide to correct the arguments or inspect the exact contract. "
+                        "Do not repeat identical failed arguments. If blocked, call done with an honest explanation.",
+                        doc_kind,
+                    )
+                except LlmError as exc:
+                    final_summary = f"Unable to recover from the tool failure: {exc}."
+                    break
+                if correction.tool_calls:
+                    pending = list(correction.tool_calls)
+                    outcome = "succeeded"
+                    if correction.text:
+                        yield {"type": "plan", "text": correction.text, "calls": [c.name for c in pending]}
+                    continue
             if already_applied or repeated_edit:
                 final_summary = (
                     f"Stopped: {call.name} would have applied the same edit "
@@ -572,23 +639,36 @@ async def run_agent_loop(
         final_summary = _summarize(call, evidence)
         step_summaries.append(final_summary)
         prev_observation = observation
+        if call.name in {"command_list", "command_describe", "doc_inspect", "look"}:
+            stalled_reads = stalled_reads + 1 if call_key in discovery_keys else 0
+            discovery_keys.add(call_key)
+            if stalled_reads >= 4:
+                outcome = "blocked"
+                final_summary = "Stopped because repeated discovery produced no actionable progress. No further edit was applied; the target or command contract needs clarification."
+                break
+        else:
+            stalled_reads = 0
+            discovery_keys.clear()
         # Ask the brain whether more steps are needed (follow-up plan).
         if pending:
             continue
         steps_line = " ".join(f"{i + 1}) {s}" for i, s in enumerate(step_summaries))
         try:
-            followup = plan_fn(
+            followup = await asyncio.to_thread(plan_fn,
                 f"Done so far: {steps_line} {_evidence_hint(evidence)} "
                 f"Original request: {message}. "
                 f"Current document state: "
                 f"{_state_line(observation, changed, previous=previous_hint, mutated=call.name in MUTATING_TOOLS)}. "
+                f"Structured observation: {json.dumps(observation, default=str)}. "
                 "If the state already satisfies the request, reply with a "
                 "done call carrying the final summary — never repeat an edit "
                 "that already landed. Otherwise reply with the next tool "
-                "calls (discover ids with command_list first).",
+                "calls (use the app skill or retained contracts; discover unfamiliar ids with command_list).",
                 doc_kind,
             )
-        except LlmError:
+        except LlmError as exc:
+            outcome = "failed"
+            final_summary = f"Unable to continue: {exc}. Completed operations: " + " ".join(step_summaries)
             break
         if followup.tool_calls:
             pending.extend(followup.tool_calls)
@@ -604,6 +684,7 @@ async def run_agent_loop(
             break
 
     if iteration >= max_iterations and pending:
+        outcome = "budget_exhausted"
         recap = " ".join(step_summaries) if step_summaries else final_summary
         final_summary = (
             f"{recap} (stopped at the iteration budget after {iteration} "
@@ -621,7 +702,8 @@ async def run_agent_loop(
             iteration=iteration,
             count=len(run.ledger),
             duration_ms=duration_ms,
-            ok=True,
+            outcome=outcome,
+            ok=outcome == "succeeded",
             **live_tag,
         ),
     )
@@ -632,6 +714,7 @@ async def run_agent_loop(
         "model": model_name,
         "iterations": iteration,
         "records": [e.record_id for e in run.ledger],
+        "outcome": outcome,
     }
 
 
@@ -782,8 +865,16 @@ async def _execute_live_call(call: ToolCall, executor: LiveExecutor) -> dict[str
     args = call.arguments
     if call.name == "command_run":
         command, params = _normalize_command_run_args(args)
-        await executor.execute(command, params or {})
-        return {"op": command}
+        result = await executor.execute(command, params or {})
+        return {"op": command, "result": result}
+    if call.name == "command_describe":
+        command = str(args.get("command", ""))
+        result = await executor.commands()
+        entries = result.get("commands", [])
+        entry = next((e for e in entries if e.get("id") == command), None)
+        if entry is None:
+            raise DocumentError(f"unknown command: {command}")
+        return {"entries": [entry], "count": 1, "total": len(entries)}
     if call.name == "command_list":
         raw_filter = args.get("filter")
         filter_text = str(raw_filter).strip() if raw_filter is not None else ""
@@ -802,13 +893,12 @@ async def _execute_live_call(call: ToolCall, executor: LiveExecutor) -> dict[str
             # Always index the FETCHED entries (they are the app's true
             # registry; a catalog fetched earlier may be stale or from a
             # different fixture).
-            keep = {
-                e["id"] for e in CommandCatalog(entries).search(filter_text, limit=50)
-            }
-            matched = [e for e in entries if e["id"] in keep]
+            ranked = CommandCatalog(entries).search(filter_text, limit=50)
+            by_id = {e["id"]: e for e in entries}
+            matched = [by_id[e["id"]] for e in ranked]
         else:
             matched = entries
-        listed: list[dict[str, str]] = []
+        listed: list[dict[str, Any]] = []
         for entry in matched:
             # Params schema rides along: the planner must learn HOW to call
             # an id (e.g. curves takes {"points": [[in,out],…]}) — a bare
@@ -819,7 +909,9 @@ async def _execute_live_call(call: ToolCall, executor: LiveExecutor) -> dict[str
                 {
                     "id": str(entry.get("id", "")),
                     "label": str(entry.get("label") or entry.get("name") or ""),
-                    "params": params_doc[:160],
+                    "params": params_doc,
+                    "enabled": entry.get("enabled"),
+                    "menu": entry.get("menu", []),
                 }
             )
         evidence: dict[str, Any] = {
@@ -845,6 +937,7 @@ async def _execute_live_call(call: ToolCall, executor: LiveExecutor) -> dict[str
             "op": "look",
             "bytes": len(png),
             "sha256": hashlib.sha256(png).hexdigest(),
+            "image_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         }
     raise DocumentError(f"unknown tool: {call.name}")
 
@@ -908,6 +1001,9 @@ def _live_detail(info: dict[str, Any]) -> dict[str, Any]:
         the keys that parsed.
     """
     detail: dict[str, Any] = {}
+    for key in ("activeLayer", "selectedLayers", "hasSelection", "selectionBounds", "revision", "mode", "depth"):
+        if key in info:
+            detail[key] = info[key]
     for key in ("width", "height"):
         value = _optional_count(info.get(key))
         if value is not None:
@@ -915,6 +1011,9 @@ def _live_detail(info: dict[str, Any]) -> dict[str, Any]:
     layers = info.get("layers")
     if isinstance(layers, list):
         detail["layers"] = len(layers)
+        detail["layer_tree"] = [
+            _planner_layer(node) for node in layers if isinstance(node, dict)
+        ]
         stack = _layer_summary(layers)
         if stack:
             detail["layer_summary"] = stack
@@ -922,6 +1021,16 @@ def _live_detail(info: dict[str, Any]) -> dict[str, Any]:
     if isinstance(history, list):
         detail["history"] = len(history)
     return detail
+
+
+def _planner_layer(node: dict[str, Any]) -> dict[str, Any]:
+    """Retain targeting and edit properties without unrelated document text."""
+    keys = ("id", "name", "kind", "blend", "opacity", "fill", "visible", "bounds",
+            "selected", "hasMask", "clipped", "adjustment")
+    result = {key: node[key] for key in keys if key in node}
+    if isinstance(node.get("children"), list):
+        result["children"] = [_planner_layer(child) for child in node["children"] if isinstance(child, dict)]
+    return result
 
 
 def _layer_summary(layers: list[Any], limit: int = 12) -> list[str]:
@@ -946,7 +1055,7 @@ def _layer_summary(layers: list[Any], limit: int = 12) -> list[str]:
             opacity = node.get("opacity")
             pieces = [p for p in (kind, blend) if p]
             if isinstance(opacity, (int, float)) and not isinstance(opacity, bool):
-                pieces.append(f"{opacity:g}%")
+                pieces.append(f"{opacity * 100:g}%")
             suffix = f" ({', '.join(pieces)})" if pieces else ""
             lines.append(f"{name}{suffix}")
             children = node.get("children")
@@ -982,7 +1091,9 @@ async def _observe_live(executor: LiveExecutor) -> dict[str, Any]:
         "detail": detail,
     }
     history = info.get("history")
-    if isinstance(history, list):
+    if "revision" in info:
+        observation["revision"] = info["revision"]
+    elif isinstance(history, list):
         observation["revision"] = len(history)
     try:
         canonical = json.dumps(info, sort_keys=True, default=str).encode("utf-8")

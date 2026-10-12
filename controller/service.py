@@ -53,9 +53,10 @@ from .live import (
     sanitize_filename,
 )
 from .llm import MockBrain
-from .logger import get_logger, safe_event
+from .logger import configure_operational_logging, get_logger, safe_event
 from .settings import SettingsError, SettingsStore, list_teams
 
+configure_operational_logging()
 log = get_logger()
 
 CHAT_HISTORY_LIMIT = 200
@@ -1109,6 +1110,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             team=team,
             live=is_live,
             live_app=live_app,
+            history=owned.history(session_id),
         )
         owned.append_history(
             session_id, "user", message, team=team_id, model=model_name
@@ -1210,6 +1212,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                                 "error": event.get("error", ""),
                                 # Compat: the view contract reads `summary`.
                                 "summary": summary,
+                                "call_id": event.get("call_id"),
                             },
                         )
                     elif etype == "observe":
@@ -1233,6 +1236,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                                 "records": event.get("records", []),
                                 # Compat: the view contract reads `message_id`.
                                 "message_id": run_id,
+                                "outcome": event.get("outcome", "succeeded"),
                             },
                         )
                     elif etype == "run.error":

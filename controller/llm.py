@@ -182,13 +182,21 @@ LIVE_APP_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "command_describe",
+            "description": "Get the complete contract, availability and parameter documentation for one command ID. Use when a search result lacks sufficient detail.",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "command_run",
             "description": (
                 "Run ANY registry command id on the user's open document "
                 "through the app's command surface — the effect is visible "
                 "immediately in the app window (id format: "
                 "image.imageRotation.90cw). Never invent ids — discover with "
-                "command_list first. Args: command (bare id string), params "
+                "the app skill or command_list first. Args: command (bare id string), params "
                 "(object or omit)."
             ),
             "parameters": {
@@ -219,7 +227,7 @@ LIVE_APP_TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Search the app's command registry — every function the app "
                 "exposes (layers, blend modes, filters, adjustments, text, "
-                "selection...). ALWAYS pass a short keyword filter (e.g. "
+                "selection...). Use known app-skill recipes directly; search for unfamiliar capabilities. Pass a short keyword filter (e.g. "
                 "'blend', 'duplicate', 'desaturate', 'rotate') — the full "
                 "registry is huge and unfiltered listings are not useful. "
                 "Returns id (label) entries; use the id in command_run."
