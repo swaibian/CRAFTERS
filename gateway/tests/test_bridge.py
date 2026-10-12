@@ -504,3 +504,56 @@ async def test_wire_transcript_exact_bytes() -> None:
         '{"id":"auth","method":"auth","params":{"token":"tok-abc"}}'
     )
     assert server.received[1] == '{"id":1,"method":"ui.inspect","params":{}}'
+
+
+async def _big_line_server(payload_len: int) -> asyncio.Server:
+    """Raw control server answering one call with a huge result line."""
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        raw = await reader.readline()
+        msg = json.loads(raw.decode("utf-8"))
+        blob = "x" * payload_len
+        writer.write(
+            (
+                json.dumps({"id": msg.get("id"), "ok": True, "result": {"blob": blob}})
+                + "\n"
+            ).encode("utf-8")
+        )
+        await writer.drain()
+        writer.close()
+
+    return await asyncio.start_server(handle, "127.0.0.1", 0)
+
+
+@pytest.mark.asyncio()
+async def test_bridge_client_accepts_reply_above_64k() -> None:
+    """Regression: the default 64 KiB StreamReader cap used to kill every
+    screenshot-sized reply with a raw ValueError (live 500)."""
+    server = await _big_line_server(200 * 1024)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        client = BridgeClient(cfg(port))
+        await client.connect()
+        try:
+            result = await client.call("ui.inspect", {})
+        finally:
+            await client.close()
+    assert len(result["blob"]) == 200 * 1024
+
+
+@pytest.mark.asyncio()
+async def test_bridge_client_oversized_reply_is_bridge_error() -> None:
+    """Past the 8 MiB desktop ceiling the failure is an honest
+    BridgeError (callers map it to 502), never a raw ValueError."""
+    server = await _big_line_server(9 * 1024 * 1024)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        client = BridgeClient(cfg(port))
+        await client.connect()
+        try:
+            with pytest.raises(BridgeError, match="8 MiB"):
+                await client.call("ui.inspect", {})
+        finally:
+            await client.close()

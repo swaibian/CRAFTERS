@@ -42,32 +42,32 @@
   --plaza-text-3: 0 0% 48%;
 
   --plaza-shadow-raised-xs:
-    3px 3px 6px hsla(214, 18%, 73%, 0.28),
-    -2px -2px 5px rgba(255, 255, 255, 0.58);
+    1.5px 1.5px 3px hsla(214, 18%, 73%, 0.28),
+    -1px -1px 2.5px rgba(255, 255, 255, 0.58);
   --plaza-shadow-raised-sm:
-    6px 6px 12px rgba(173, 184, 198, 0.34),
-    -5px -5px 10px rgba(255, 255, 255, 0.62);
+    3px 3px 6px rgba(173, 184, 198, 0.34),
+    -2.5px -2.5px 5px rgba(255, 255, 255, 0.62);
   --plaza-shadow-raised-md:
-    12px 12px 24px rgba(173, 184, 198, 0.74),
-    -12px -12px 24px rgba(255, 255, 255, 0.96);
+    6px 6px 12px rgba(173, 184, 198, 0.74),
+    -6px -6px 12px rgba(255, 255, 255, 0.96);
   --plaza-shadow-shell-sm:
-    4px 4px 14px rgba(173, 184, 198, 0.54),
-    -4px -4px 14px rgba(255, 255, 255, 0.9);
+    2px 2px 7px rgba(173, 184, 198, 0.54),
+    -2px -2px 7px rgba(255, 255, 255, 0.9);
   --plaza-shadow-shell-md:
-    10px 10px 18px rgba(173, 184, 198, 0.72),
-    -10px -10px 18px rgb(255, 255, 255);
+    5px 5px 9px rgba(173, 184, 198, 0.72),
+    -5px -5px 9px rgb(255, 255, 255);
   --plaza-shadow-inset-sm:
-    inset 4px 4px 8px rgba(185, 196, 210, 0.72),
-    inset -4px -4px 8px rgba(255, 255, 255, 0.94);
+    inset 2px 2px 4px rgba(185, 196, 210, 0.72),
+    inset -2px -2px 4px rgba(255, 255, 255, 0.94);
   --plaza-shadow-inset-md:
-    inset 8px 8px 16px rgba(185, 196, 210, 0.92),
-    inset -8px -8px 16px rgba(255, 255, 255, 0.98);
+    inset 4px 4px 8px rgba(185, 196, 210, 0.92),
+    inset -4px -4px 8px rgba(255, 255, 255, 0.98);
   --plaza-hard-edge:
-    inset 1px 1px 0 rgba(255, 255, 255, 0.54),
-    inset -1px -1px 0 rgba(175, 186, 200, 0.24);
+    inset 0.5px 0.5px 0 rgba(255, 255, 255, 0.54),
+    inset -0.5px -0.5px 0 rgba(175, 186, 200, 0.24);
   --plaza-hard-edge-inset:
-    inset 1px 1px 0 rgba(171, 184, 199, 0.26),
-    inset -1px -1px 0 rgba(255, 255, 255, 0.56);
+    inset 0.5px 0.5px 0 rgba(171, 184, 199, 0.26),
+    inset -0.5px -0.5px 0 rgba(255, 255, 255, 0.56);
 
   --plaza-radius-shell: 2rem;
   --plaza-radius-panel: 1.4rem;
@@ -147,6 +147,7 @@ html.dark { color-scheme: dark; }
 body {
   margin: 0;
   min-height: 100vh;
+  max-height: 100vh;
   padding: 2px;
   color: hsl(var(--plaza-text-1));
   font-family: system-ui, -apple-system, sans-serif;
@@ -161,7 +162,7 @@ body {
       hsl(var(--plaza-accent-coral) / 0.04),
       transparent 24%
     ),
-    linear-gradient(145deg, #cacaca, #f0f0f0);
+    linear-gradient(145deg, #e4e9ef, #eff2f5);
 }
 
 .dark body,
@@ -538,7 +539,7 @@ body.dark {
   border-radius: var(--plaza-radius-control);
 }
 
-.layout { display: flex; flex: 1; min-height: 0; gap: 15px; padding: 15px; }
+.layout { display: flex; flex: 1; min-height: 0; gap: 15px; padding: 15px; max-height: 94vh; }
 
 /* ── Conversations sidebar (first Marko column; was unstyled → slid under .left) ── */
 
@@ -620,6 +621,7 @@ body.dark {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem 0.5rem;
+  min-width: 0;
   padding: 0.5rem 0.6rem;
   border: 1px solid hsl(var(--border) / 0.72);
   border-radius: var(--plaza-radius-control);
@@ -632,17 +634,32 @@ body.dark {
 }
 
 .liveapp-row strong { font-size: 0.9rem; }
+.liveapp-row > button { max-width: 100%; }
 
 .liveapp-hint { flex-basis: 100%; margin: 0; }
 .liveapp-hint code {
   white-space: normal;
   overflow-wrap: anywhere;
-  font-size: 0.72rem;
+  font-size: 0.5rem;
+  color: #54a69c;
+
 }
 
-.liveapp-docs { list-style: none; margin: 0; padding: 0; flex-basis: 100%; display: flex; flex-direction: column; gap: 0.25rem; }
-.liveapp-docs li { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; }
-.liveapp-docs li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.liveapp-docs { list-style: none; margin: 0; padding: 0; flex-basis: 100%; min-width: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.liveapp-docs li {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid hsl(var(--border) / 0.6);
+  border-radius: var(--plaza-radius-control);
+  background: hsl(var(--plaza-surface-inset) / 0.5);
+  font-size: 0.82rem;
+}
+.liveapp-docs li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.liveapp-docs li button { align-self: stretch; max-width: 100%; white-space: normal; }
 
 /* ── Chat toolbar + model picker modal ── */
 
@@ -806,6 +823,7 @@ body.dark {
 
 .left {
   width: 300px;
+  min-width: 0;
   padding: 1rem;
   display: flex;
   flex-direction: column;

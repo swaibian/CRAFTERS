@@ -34,6 +34,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -179,9 +180,14 @@ class LiveManager:
     holding one open buys nothing and leaks on shutdown.
 
     :param bridges: App id → :class:`BridgeConfig` (loopback only).
+    :param roots: App id → automation write root recorded at launch
+        (:func:`launch_app`). :meth:`screenshot_png` saves its capture
+        inside the root because the app's write authority is confined
+        there — a system-temp path would be rejected.
     """
 
     bridges: dict[str, BridgeConfig] = field(default_factory=dict)
+    roots: dict[str, str] = field(default_factory=dict)
 
     async def status(self, app: str) -> LiveStatus:
         """Probe one app's control channel (never raises).
@@ -290,6 +296,13 @@ class LiveManager:
         switched to it first via ``engine.execute {document.activate}``
         (photocraft style) so the capture shows the selected document.
 
+        File-first: the capture is saved to ``{"path": ...}`` inside the
+        app's automation write root (recorded at launch; system temp
+        otherwise) and read back locally — a full-window base64 reply
+        blows past the 8 MiB control-channel ceiling (that was a live
+        500). Base64 remains the fallback for small windows and older
+        replies.
+
         :param app: App id (must be configured).
         :param document: Engine document index to activate first (None =
             keep the active document).
@@ -307,8 +320,30 @@ class LiveManager:
                     "engine.execute",
                     {"command": "document.activate", "params": {"document": document}},
                 )
-        reply = await self._call(app, "ui.screenshot", {})
-        png = _extract_png_bytes(reply)
+        shot_dir = self.roots.get(app) or tempfile.gettempdir()
+        fd, shot_path = tempfile.mkstemp(
+            prefix=f"crafter-shot-{app}-", suffix=".png", dir=shot_dir
+        )
+        os.close(fd)
+        png: bytes | None = None
+        reply: dict[str, Any] = {}
+        try:
+            try:
+                reply = await self._call(app, "ui.screenshot", {"path": shot_path})
+                png = _read_png_file(shot_path)
+            except LiveError:
+                # Rejected path (unknown roots, read-only dir) or an app
+                # without file output — fall through to base64 below.
+                png = None
+            if png is None and not reply:
+                reply = await self._call(app, "ui.screenshot", {})
+            if png is None:
+                png = _extract_png_bytes(reply)
+        finally:
+            try:
+                os.unlink(shot_path)
+            except OSError:
+                pass
         if png is None:
             raise LiveError("could not capture the live window (is it occluded?)")
         log.info(
@@ -359,7 +394,8 @@ def resolve_desktop_binary(app: str, *, env: Any = os.environ) -> str | None:
     """Locate a launchable desktop GUI binary (never raises).
 
     Precedence: ``CRAFTER_DESKTOP_<APP>`` (explicit path, must be
-    executable) → ``<app>`` on ``PATH``. Anything else (unknown app,
+    executable) → ``<app>`` on ``PATH`` (``shutil.which`` resolves
+    ``.exe`` via ``PATHEXT`` on Windows). Anything else (unknown app,
     missing binary) resolves to None so the caller can report the hint.
 
     :param app: App id.
@@ -405,6 +441,25 @@ def desktop_launch_argv(app: str, *, token_file: str, work_root: str) -> list[st
     raise LiveError(f"{app} cannot be launched (no TCP control channel)")
 
 
+def _detached_kwargs() -> dict[str, Any]:
+    """Platform-appropriate "outlive the server" spawn flags.
+
+    POSIX (macOS/Linux): ``start_new_session=True`` (``setsid`` — the
+    window survives controller restarts; ``start_new_session`` is not
+    accepted on Windows). Windows: ``DETACHED_PROCESS |
+    CREATE_NEW_PROCESS_GROUP`` (no console window, Ctrl+C of the server
+    does not reach the app).
+
+    :returns: Extra :func:`subprocess.Popen` kwargs for this platform.
+    """
+    if sys.platform == "win32":
+        return {
+            "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    return {"start_new_session": True}
+
+
 def _spawn_detached(
     argv: list[str], log_path: str, *, spawn: Callable[..., Any]
 ) -> Any:
@@ -423,9 +478,9 @@ def _spawn_detached(
         with open(log_path, "ab") as log_handle:
             return spawn(
                 argv,
-                start_new_session=True,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
+                **_detached_kwargs(),
             )
     except OSError as exc:
         raise LiveError(f"could not start {argv[0] if argv else '?'} ({exc})") from None
@@ -448,6 +503,15 @@ async def launch_app(
     running without a restart, and the channel is polled until it
     answers or ``timeout_s`` elapses (the app keeps starting in the
     background — Refresh picks it up).
+
+    Platform notes (ArtCraft ships on all three — the same call works):
+    macOS/Linux detach via ``setsid``; Windows via ``DETACHED_PROCESS |
+    CREATE_NEW_PROCESS_GROUP`` (no console window). The child inherits
+    the server environment, so on Linux it needs ``DISPLAY``/``X11``
+    (or Xvfb/offscreen) and on macOS a logged-in Aqua session — a
+    headless daemon/SSH session without a display cannot show a window
+    (the call then times out honestly instead of failing loudly).
+    ``shutil.which`` resolves ``.exe`` via ``PATHEXT`` on Windows.
 
     :param manager: Live manager (mutated: bridge config registered).
     :param app: App id.
@@ -482,7 +546,10 @@ async def launch_app(
     if app == "photocraft":
         fd, token_file = tempfile.mkstemp(prefix=f"crafter-{app}-", suffix=".token")
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            # Else (Windows): no POSIX perms — the per-user temp dir ACL
+            # is the protection; the token never hits logs either way.
             with os.fdopen(fd, "w") as handle:
                 handle.write(secrets.token_hex(32))
         except OSError:
@@ -503,6 +570,8 @@ async def launch_app(
         token_file=token_file or None,
         inspect_style="engine" if app == "photocraft" else "direct",
     )
+    # Screenshot captures must land inside the automation write root.
+    manager.roots[app] = work_root
     log.info(
         "live app launched: %s",
         safe_event(event="live_launch", app=app, ok=True, pid=pid, port=port),
@@ -538,6 +607,23 @@ def _optional_int(value: Any) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _read_png_file(path: str, *, max_bytes: int = 64 * 1024 * 1024) -> bytes | None:
+    """Read back a screenshot the app saved to ``path`` (never logged).
+
+    :param path: Capture file written by ``ui.screenshot {path}``.
+    :param max_bytes: Sanity cap (refuse absurd files).
+    :returns: Raw PNG bytes, or None when missing/empty/huge/not a PNG.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    if not raw or len(raw) > max_bytes or raw[:8] != _PNG_MAGIC:
+        return None
+    return raw
 
 
 def _extract_png_bytes(reply: dict[str, Any]) -> bytes | None:

@@ -105,15 +105,35 @@ export CRAFTER_WORK_DIR="$WORK_DIR"
 # (pdfcraft has no TCP control channel — drop the PDF file instead.)
 #
 # For path A, point the controller at the desktop binaries (built with e.g.
-# `cargo build --release -p photocraft` in the app source checkout):
+# `cargo build --release -p photocraft` in the app source checkout).
+# Precedence per app: CRAFTER_DESKTOP_<APP> (already set) → PATH →
+# deploy/local-bin-paths.env (PHOTOCRAFT_DESKTOP=...) → well-known
+# ~/Downloads/CRAFT/<app>-main/target/release/<app> build locations.
+if [[ -f "$ROOT/deploy/local-bin-paths.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/deploy/local-bin-paths.env"
+  set +a
+fi
 for _app in photocraft gridcraft; do
   _var="CRAFTER_DESKTOP_$(printf '%s' "$_app" | tr '[:lower:]' '[:upper:]')"
-  if [[ -z "${!_var:-}" ]] && have "$_app"; then
-    export "$_var"="$(command -v "$_app")"
+  _alt="$(printf '%s_DESKTOP' "$_app" | tr '[:lower:]' '[:upper:]')"
+  if [[ -z "${!_var:-}" ]]; then
+    if have "$_app"; then
+      export "$_var"="$(command -v "$_app")"
+    elif [[ -n "${!_alt:-}" && -x "${!_alt}" ]]; then
+      export "$_var"="${!_alt}"
+    elif [[ -x "$HOME/Downloads/CRAFT/${_app}-main/target/release/$_app" ]]; then
+      export "$_var"="$HOME/Downloads/CRAFT/${_app}-main/target/release/$_app"
+    fi
+  fi
+  if [[ -n "${!_var:-}" ]]; then
     echo "→ live launch: $_app at ${!_var}"
+  else
+    echo "→ live launch: $_app binary not found (Launch will 502 — build it or set $_var)"
   fi
 done
-unset _app _var
+unset _app _var _alt
 
 PIDS=()
 CLEANING_UP=0

@@ -241,7 +241,15 @@ class BridgeClient:
             return
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self._config.host, self._config.port),
+                asyncio.open_connection(
+                    self._config.host,
+                    self._config.port,
+                    # Default StreamReader cap is 64 KiB — real replies
+                    # (window screenshots) are bigger. Cap at the documented
+                    # 8 MiB desktop ceiling instead; anything larger is
+                    # rejected per-line in call().
+                    limit=REPLY_MAX_BYTES + 1,
+                ),
                 timeout=self._config.timeout_s,
             )
         except (OSError, asyncio.TimeoutError) as exc:
@@ -300,7 +308,20 @@ class BridgeClient:
             try:
                 async with asyncio.timeout(self._config.timeout_s):
                     while True:
-                        raw = await self._reader.readline()
+                        try:
+                            raw = await self._reader.readline()
+                        except (
+                            ValueError,
+                            asyncio.IncompleteReadError,
+                            asyncio.LimitOverrunError,
+                        ) as exc:
+                            # The reply line blew past the 8 MiB ceiling
+                            # (a full-window base64 screenshot does this) —
+                            # honest error, never a 500.
+                            raise BridgeError(
+                                "reply exceeds 8 MiB limit "
+                                "(screenshot to a file instead)"
+                            ) from exc
                         if not raw:
                             raise BridgeError("control connection closed")
                         if len(raw) > REPLY_MAX_BYTES + 1:
@@ -330,7 +351,14 @@ class BridgeClient:
         assert self._reader is not None
         try:
             async with asyncio.timeout(self._config.timeout_s):
-                raw = await self._reader.readline()
+                try:
+                    raw = await self._reader.readline()
+                except (
+                    ValueError,
+                    asyncio.IncompleteReadError,
+                    asyncio.LimitOverrunError,
+                ) as exc:
+                    raise BridgeError("reply exceeds 8 MiB limit") from exc
         except TimeoutError as exc:
             raise BridgeError("control auth timed out") from exc
         if not raw:

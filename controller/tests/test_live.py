@@ -18,6 +18,7 @@ import os
 import socket
 import tempfile
 import threading
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -536,3 +537,130 @@ def test_launch_argv_rejects_non_launchable(tmp_path):
         assert "no TCP control channel" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected LiveError")
+
+
+def test_detached_kwargs_match_platform(monkeypatch):
+    import sys
+
+    import controller.live as live_mod
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    # Simulate the Windows-only creation flags (absent on macOS/Linux).
+    monkeypatch.setattr(live_mod.subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+    monkeypatch.setattr(
+        live_mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False
+    )
+    win_flags = live_mod._detached_kwargs()
+    assert "creationflags" in win_flags and "start_new_session" not in win_flags
+    assert win_flags["creationflags"] == 0x8 | 0x200
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    posix_flags = live_mod._detached_kwargs()
+    assert posix_flags == {"start_new_session": True}
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert live_mod._detached_kwargs() == {"start_new_session": True}
+
+
+def test_resolve_desktop_binary_prefers_explicit_env(tmp_path, monkeypatch):
+    from controller.live import resolve_desktop_binary
+
+    exe = tmp_path / "photocraft"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("CRAFTER_DESKTOP_PHOTOCRAFT", str(exe))
+    assert resolve_desktop_binary("photocraft") == str(exe)
+    # Non-executable explicit path resolves to None (never falls to PATH).
+    other = tmp_path / "nope"
+    other.write_text("x")
+    other.chmod(0o644)
+    monkeypatch.setenv("CRAFTER_DESKTOP_PHOTOCRAFT", str(other))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert resolve_desktop_binary("photocraft") is None
+    assert resolve_desktop_binary("pdfcraft") is None
+
+
+def test_screenshot_prefers_capture_file(tmp_path, monkeypatch):
+    """Regression (live 500): full-window base64 replies exceed the 8 MiB
+    control-channel ceiling. The capture must go to {"path"} inside the
+    launch-recorded root and the temp file must be cleaned up."""
+    import asyncio
+
+    import controller.live as live_mod
+    from controller.live import LiveManager
+
+    root = tmp_path / "desktops"
+    root.mkdir()
+    calls: list = []
+
+    async def fake_call(self, app, method, params):
+        assert method == "ui.screenshot"
+        calls.append(dict(params))
+        assert params["path"].startswith(str(root))
+        Path(params["path"]).write_bytes(PNG_BYTES)
+        return {"path": params["path"], "width": 48, "height": 32}
+
+    async def go():
+        manager = LiveManager(bridges={}, roots={"photocraft": str(root)})
+        with monkeypatch.context() as m:
+            m.setattr(LiveManager, "_call", fake_call)
+            assert live_mod._read_png_file(str(root / "junk.bin")) is None
+            png = await manager.screenshot_png("photocraft")
+        assert png == PNG_BYTES
+        leftovers = [p for p in root.iterdir() if p.name.startswith("crafter-shot-")]
+        assert leftovers == []
+        assert calls and "path" in calls[0]
+
+    asyncio.run(go())
+
+
+def test_screenshot_falls_back_to_base64(tmp_path, monkeypatch):
+    """Manually started apps (unknown roots) reject the temp path — the
+    small-window base64 reply still works."""
+    import asyncio
+    import base64
+
+    from controller.live import LiveError, LiveManager
+
+    async def fake_call(self, app, method, params):
+        if params.get("path"):
+            raise LiveError("automation write authority is not configured")
+        return {"image": base64.b64encode(PNG_BYTES).decode("ascii")}
+
+    async def go():
+        manager = LiveManager(bridges={})
+        with monkeypatch.context() as m:
+            m.setattr(LiveManager, "_call", fake_call)
+            assert await manager.screenshot_png("photocraft") == PNG_BYTES
+
+    asyncio.run(go())
+
+
+def test_launch_records_roots_for_screenshots(tmp_path, monkeypatch):
+    """launch_app stores the automation root so screenshot_png can aim
+    its capture file inside the write authority."""
+    import asyncio
+    import types
+
+    import controller.live as live_mod
+    from controller.live import LiveManager, launch_app
+
+    _fake_binary(tmp_path, monkeypatch, "gridcraft")
+
+    def fake_spawn(argv, **kwargs):
+        return types.SimpleNamespace(pid=7)
+
+    async def go():
+        with LiveStubServer() as stub:
+            manager = LiveManager(bridges={})
+            with monkeypatch.context() as m:
+                m.setattr(live_mod.subprocess, "Popen", fake_spawn)
+                m.setattr(
+                    live_mod,
+                    "LAUNCH_PORTS",
+                    {"photocraft": 7878, "gridcraft": stub.port},
+                )
+                await launch_app(manager, "gridcraft", timeout_s=5.0)
+            assert manager.roots["gridcraft"] == str(tmp_path / "desktops")
+
+    asyncio.run(go())

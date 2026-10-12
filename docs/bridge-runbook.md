@@ -190,7 +190,18 @@ through real processes (status → documents → attach → mock chat
 To test with a real window: build the desktop binary
 (`cargo build --release --bin photocraft` in `photocraft-main`), start it
 per §5 step 1, export the two `CRAFTER_BRIDGE_PHOTOCRAFT*` vars, then
-`./start.sh`.
+`./start.sh` — or just press **Launch** in section *3 · Live app window*
+(needs the binary on `PATH` or `CRAFTER_DESKTOP_<APP>` set).
+
+Per-OS notes (Launch works on all three — same button, same endpoint):
+macOS/Linux detach via `setsid`, Windows via `DETACHED_PROCESS |
+CREATE_NEW_PROCESS_GROUP` (no console window). The child inherits the
+server environment: on Linux it needs `DISPLAY`/`WAYLAND_DISPLAY` (headless
+servers: Xvfb or the app's offscreen mode); on macOS the controller must run
+in a logged-in Aqua session (a bare SSH/daemon session has no window server
+— Launch then times out honestly, Refresh retries). Windows resolves
+`photocraft.exe` via `PATHEXT`; dev entry point there is `start.ps1`
+(PowerShell mirror of `start.sh`).
 
 Troubleshooting: connection refused → app not started with `--control`;
 auth rejected → token file mismatch (photocraft rotates only when the file
