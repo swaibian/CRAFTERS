@@ -59,6 +59,11 @@ class OpenDocument:
     :param work_path: Working copy path (mutations land here).
     :param revision: Mutation counter (bumped per op, snapshot-guarded).
     :param revisions: Revision → backup path (lightweight snapshot store).
+    :param source: ``"upload"`` (dropped file) or ``"live"`` (captured from
+        a running desktop app via ``POST /api/live/attach``).
+    :param live_app: Desktop app the copy was captured from (``source ==
+        "live"`` only, e.g. ``"photocraft"``).
+    :param live_index: Engine document index captured (``source == "live"``).
     """
 
     doc_id: str
@@ -67,6 +72,9 @@ class OpenDocument:
     work_path: Path
     revision: int = 0
     revisions: dict[int, Path] = field(default_factory=dict)
+    source: str = "upload"
+    live_app: str | None = None
+    live_index: int | None = None
 
 
 class DocumentRegistry:

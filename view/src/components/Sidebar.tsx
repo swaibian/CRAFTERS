@@ -88,16 +88,25 @@ export function Sidebar({
   const [resuming, setResuming] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       try {
-        setConversations(await fetchConversations());
+        const convs = await fetchConversations();
+        if (!cancelled) {
+          setConversations(convs);
+          setError(null);
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Could not load conversations');
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load conversations');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+    // Re-fetch when the active session changes so New chat / resume stays visible.
+  }, [activeSessionId]);
 
   async function handleResume(conv: ConversationSummary) {
     setResuming(conv.id);
@@ -150,19 +159,24 @@ export function Sidebar({
         [...groups.entries()].map(([label, items]) => (
           <section key={label} aria-label={`${label} conversations`}>
             <h3 className="muted tiny" data-testid={`group-${label}`}>
-              {label} ({items.length})
+              {label} <span className="conv-count">{items.length}</span>
             </h3>
-            <ul>
+            <ul className="conv-list">
               {items.map((c) => (
-                <li key={c.id} data-testid="conversation-item">
+                <li
+                  key={c.id}
+                  data-testid="conversation-item"
+                  className={`conv-item${activeSessionId === c.id ? ' active' : ''}`}
+                >
                   <button
                     type="button"
+                    className="conv-btn"
                     aria-current={activeSessionId === c.id ? 'true' : undefined}
                     disabled={resuming === c.id}
                     onClick={() => void handleResume(c)}
                     title={c.title}
                   >
-                    <strong>{c.title}</strong>{' '}
+                    <strong className="conv-title">{c.title}</strong>{' '}
                     <span className="muted tiny">
                       {relativeTime(c.updated_at)} · {c.message_count} msgs
                     </span>{' '}

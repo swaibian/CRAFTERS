@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { CrafterChat, useChatMessages } from './components/CrafterChat';
 import { Diagnostics } from './components/Diagnostics';
 import { Dropzone } from './components/Dropzone';
+import { LiveApp } from './components/LiveApp';
 import { Settings } from './components/Settings';
 import { newSessionId, Sidebar } from './components/Sidebar';
 import { ToolPicker } from './components/ToolPicker';
@@ -87,6 +88,20 @@ function ChatPage({
 
   return (
     <div className="layout">
+      <aside className="left" aria-label="Tool picker and file input">
+        <h2 className="plaza-heading-section">1 · Pick app</h2>
+        <ToolPicker selected={app} onSelect={setApp} />
+        <h2 className="plaza-heading-section">2 · Drop file</h2>
+        <Dropzone app={app} opened={opened} sessionId={sessionId} onOpened={setOpened} />
+        <h2 className="plaza-heading-section">3 · Live app window</h2>
+        <LiveApp sessionId={sessionId} onOpened={setOpened} />
+        {connection === 'offline' && (
+          <p className="notice" role="status">
+            Controller offline — mock fallback notice: start the controller (:8790) for live
+            file-open and chat.
+          </p>
+        )}
+      </aside>
       <Sidebar
         activeSessionId={sessionId}
         onNewChat={() => {
@@ -105,18 +120,6 @@ function ChatPage({
           logger.info('chat.resumed', {});
         }}
       />
-      <aside className="left" aria-label="Tool picker and file input">
-        <h2 className="plaza-heading-section">1 · Pick app</h2>
-        <ToolPicker selected={app} onSelect={setApp} />
-        <h2 className="plaza-heading-section">2 · Drop file</h2>
-        <Dropzone app={app} opened={opened} sessionId={sessionId} onOpened={setOpened} />
-        {connection === 'offline' && (
-          <p className="notice" role="status">
-            Controller offline — mock fallback notice: start the controller (:8790) for live
-            file-open and chat.
-          </p>
-        )}
-      </aside>
       <main className="center">
         <CrafterChat
           messages={messages}
@@ -179,7 +182,7 @@ export function App() {
       <header className="topbar">
         <a href="#/" className="brand" aria-label="Crafter Chat home">
           <img src="/assets/swaibian_black.svg" alt="Swaibian" />
-          <span>
+          <span className="plaza-text-gradient">
             Crafter Chat
           </span>
         </a>

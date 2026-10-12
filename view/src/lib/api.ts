@@ -58,6 +58,10 @@ export interface OpenedFile {
   session_id: string;
   inspect: Record<string, unknown>;
   thumbnail_url?: string;
+  /** "upload" (dropped file) or "live" (captured from a running desktop app). */
+  source?: string;
+  /** Desktop app the copy was captured from (source === "live" only). */
+  live_app?: string;
 }
 
 export interface ChatStreamRequest {
@@ -244,6 +248,8 @@ function toOpenedFile(data: Record<string, unknown>, fallbackSession: string): O
     thumbnail_url:
       (data.thumbnail_url as string | undefined) ??
       `/api/files/${encodeURIComponent(docId)}/thumbnail?session_id=${encodeURIComponent(sessionId)}`,
+    source: (data.source as string | undefined) ?? 'upload',
+    live_app: data.live_app as string | undefined,
   };
 }
 export async function openFile(file: File, app: string, session_id?: string): Promise<OpenedFile> {
@@ -288,6 +294,117 @@ export function thumbnailUrl(docId: string, sessionId?: string): string {
 export function downloadResultUrl(docId: string, sessionId?: string): string {
   const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
   return `/api/files/${encodeURIComponent(docId)}/download${qs}`;
+}
+
+// --- Live desktop apps (started with --control) ---
+
+export interface LiveAppStatus {
+  app: string;
+  running: boolean;
+  mode: string;
+  /** TCP apps the Launch button may start (pdfcraft stays manual). */
+  launchable?: boolean;
+  last_error?: string;
+  hint?: string;
+}
+
+export interface LiveDocument {
+  index: number;
+  name: string;
+  width?: number | null;
+  height?: number | null;
+  dirty: boolean;
+  active: boolean;
+}
+
+/**
+ * Probe every live-app control channel (GET /api/live/status).
+ * Never rejects on app-down — down apps come back as running:false.
+ */
+export async function fetchLiveStatus(): Promise<LiveAppStatus[]> {
+  const data = await request<{ apps: LiveAppStatus[] }>('/api/live/status');
+  return data.apps ?? [];
+}
+
+/**
+ * List the documents open in a live window (GET /api/live/documents).
+ * 502 = app down (message names the --control command to start it).
+ */
+export async function fetchLiveDocuments(app: string): Promise<{ active: number | null; documents: LiveDocument[] }> {
+  const data = await request<{ active: number | null; documents: LiveDocument[] }>(
+    `/api/live/documents?app=${encodeURIComponent(app)}`,
+  );
+  return { active: data.active ?? null, documents: data.documents ?? [] };
+}
+
+/**
+ * Start a down desktop app and wait for its control channel
+ * (POST /api/live/launch). 409 = not launchable (pdfcraft, file-based —
+ * start by hand); 502 = binary missing / still starting (Refresh retries).
+ */
+export async function launchLiveApp(app: string): Promise<{ app: string; running: boolean; mode: string }> {
+  logger.info('api.live.launch', { app });
+  let res: Response;
+  try {
+    res = await fetch('/api/live/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app }),
+    });
+  } catch {
+    logger.warn('api.unreachable', { path: '/api/live/launch' });
+    throw new ApiError('Controller unreachable at /api/live/launch', { unreachable: true, status: 0 });
+  }
+  if (!res.ok) {
+    logger.warn('api.http-error', { path: '/api/live/launch', status: res.status });
+    let detail = `Live launch failed (${res.status})`;
+    try {
+      const body = (await res.json()) as { detail?: string | { error?: string; hint?: string } };
+      if (typeof body.detail === 'string') detail = body.detail;
+      else if (body.detail?.error) detail = body.detail.hint ? `${body.detail.error} — ${body.detail.hint}` : body.detail.error;
+    } catch {
+      /* keep the status form */
+    }
+    throw new ApiError(detail, { status: res.status });
+  }
+  const data = (await res.json()) as { app: string; running: boolean; mode: string };
+  logger.info('api.live.launched', { app });
+  return data;
+}
+
+/**
+ * Capture a live-window document as the chat object (POST /api/live/attach).
+ * Returns the same OpenedFile shape as openFile (source: "live"), so the
+ * caller binds it to chat exactly like an upload.
+ */
+export async function attachLiveDoc(app: string, index: number | null, session_id?: string): Promise<OpenedFile> {
+  logger.info('api.live.attach', { app });
+  let res: Response;
+  try {
+    res = await fetch('/api/live/attach', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: session_id ?? 'default', app, document: index }),
+    });
+  } catch {
+    logger.warn('api.unreachable', { path: '/api/live/attach' });
+    throw new ApiError('Controller unreachable at /api/live/attach', { unreachable: true, status: 0 });
+  }
+  if (!res.ok) {
+    logger.warn('api.http-error', { path: '/api/live/attach', status: res.status });
+    let detail = `Live attach failed (${res.status})`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      /* keep the status form */
+    }
+    throw new ApiError(detail, { status: res.status });
+  }
+  const data = (await res.json()) as Record<string, unknown>;
+  const opened = toOpenedFile(data, session_id ?? 'default');
+  logger.info('api.live.attached', { app, doc_id: opened.doc_id });
+  return opened;
 }
 
 // --- SSE stream reader (fetch + reader; EventSource cannot POST) ---

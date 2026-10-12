@@ -47,6 +47,7 @@ export function ToolPicker({
           className={selected === app.id ? 'app-card selected' : 'app-card'}
           onClick={() => onSelect(app.id)}
         >
+          <span className="app-dot" aria-hidden="true" data-ready={app.enabled} />
           <span className="app-name">{app.name}</span>
           <span className="app-hint">{app.enabled ? app.hint : 'soon'}</span>
         </button>

@@ -12,6 +12,7 @@ import { nextId, type ChatMessage } from '../lib/chat';
 import { resizeImage } from '../lib/image';
 import { logger } from '../lib/logger';
 import { Markdown } from './Markdown';
+import { ModelPicker } from './ModelPicker';
 import { ToolcallBlockView } from './ToolcallView';
 
 export function CrafterChat({
@@ -117,11 +118,23 @@ export function CrafterChat({
 
   return (
     <section className="chat" aria-label="Chat thread">
-      {answeringModel && (
-        <p className="muted tiny" data-testid="answering-model">
-          answering with {answeringModel}
-        </p>
-      )}
+      <div className="chat-toolbar">
+        {answeringModel ? (
+          <p className="muted tiny" data-testid="answering-model">
+            answering with {answeringModel}
+          </p>
+        ) : (
+          <span />
+        )}
+        <ModelPicker
+          models={models}
+          selected={selectedModel ?? null}
+          disabled={!profileId || (modelsLoading && models.length === 0)}
+          loading={modelsLoading}
+          noProfile={!profileId}
+          onChange={onModelChange}
+        />
+      </div>
       <div className="thread" ref={threadRef} role="log" aria-live="polite" aria-label="Messages">
         {messages.length === 0 && (
           <p className="muted">
@@ -197,23 +210,6 @@ export function CrafterChat({
       )}
 
       <div className="composer">
-        <label className="muted tiny">
-          Model
-          <select
-            aria-label="Chat model"
-            value={selectedModel ?? ''}
-            disabled={!profileId || modelsLoading || models.length === 0}
-            onChange={(e) => onModelChange?.(e.target.value || null)}
-            title={!profileId ? 'mock brain — pick a profile in Settings' : undefined}
-          >
-            <option value="">{!profileId ? 'mock brain' : modelsLoading ? 'loading…' : 'profile default'}</option>
-            {models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
-        </label>
         {attached && (
           <div className="attach-preview">
             <img src={attached} alt="Image staged to send" />

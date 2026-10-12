@@ -129,6 +129,7 @@ export function Dropzone({
             <strong>{opened.name}</strong>
             <div className="muted">
               {opened.app} · {inspectSummary(opened.inspect)}
+              {opened.source === 'live' && ` · live window (${opened.live_app ?? 'app'})`}
             </div>
           </div>
           {previewSrc && !previewHidden && (

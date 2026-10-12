@@ -40,6 +40,16 @@ from .documents import (
     PhotoAdapter,
     SheetAdapter,
 )
+from .live import (
+    LAUNCHABLE_APPS,
+    LIVE_APPS,
+    START_HINTS,
+    LiveError,
+    LiveManager,
+    launch_app,
+    live_manager_from_env,
+    sanitize_filename,
+)
 from .llm import MockBrain
 from .logger import get_logger, safe_event
 from .settings import SettingsError, SettingsStore, list_teams
@@ -75,10 +85,15 @@ class ServiceState:
 
     :param settings: Settings store (profiles + gateway + Scaico + team).
     :param work_root: Root dir holding per-session work dirs.
+    :param live: Live-app manager (defaults to env-based; tests inject
+        stub configs here).
     """
 
     def __init__(
-        self, settings: SettingsStore | None = None, work_root: str | Path | None = None
+        self,
+        settings: SettingsStore | None = None,
+        work_root: str | Path | None = None,
+        live: LiveManager | None = None,
     ) -> None:
         self.settings = settings or SettingsStore()
         root = (
@@ -87,6 +102,7 @@ class ServiceState:
         self.work_root = root
         self.work_root.mkdir(parents=True, exist_ok=True)
         self.sessions = SessionRegistry(default_roots=[self.work_root])
+        self.live = live if live is not None else live_manager_from_env()
         self._registries: dict[str, DocumentRegistry] = {}
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._mock = MockBrain()
@@ -492,6 +508,8 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             "app": doc.kind,
             "name": doc.source_name,
             "source_name": doc.source_name,
+            "source": doc.source,
+            "live_app": doc.live_app,
             "session_id": session_id,
             "thumbnail_url": f"/api/files/{doc.doc_id}/thumbnail?session_id={session_id}",
             "work_path": str(doc.work_path),
@@ -520,6 +538,8 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             "app": doc.kind,
             "name": doc.source_name,
             "source_name": doc.source_name,
+            "source": doc.source,
+            "live_app": doc.live_app,
             "session_id": session_id,
             "thumbnail_url": f"/api/files/{doc_id}/thumbnail?session_id={session_id}",
             "inspect": evidence,
@@ -567,6 +587,188 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             owned.check_session_path(session_id, thumb)
             return FileResponse(path=str(thumb), media_type="image/png")
         raise HTTPException(status_code=404, detail="no thumbnail for this document")
+
+    # -- live: desktop apps started with --control as chat objects -----------
+
+    @app.get("/api/live/status")
+    async def live_status() -> dict[str, Any]:
+        """Probe every live-app control channel (never fails, never raises).
+
+        :returns: ``{apps: [{app, running, mode, launchable, last_error?, hint?}]}``
+            where ``mode`` is ``"bridge"`` (live) or ``"down"``,
+            ``launchable`` marks the TCP apps the Launch button may start,
+            and ``hint`` is the exact ``--control`` start command when down.
+        """
+        entries: list[dict[str, Any]] = []
+        for app_name in LIVE_APPS:
+            state = await owned.live.status(app_name)
+            entry: dict[str, Any] = {
+                "app": state.app,
+                "running": state.running,
+                "mode": state.mode,
+                "launchable": app_name in LAUNCHABLE_APPS,
+            }
+            if state.last_error:
+                entry["last_error"] = state.last_error
+            if state.hint:
+                entry["hint"] = state.hint
+            entries.append(entry)
+        return {"apps": entries}
+
+    @app.get("/api/live/documents")
+    async def live_documents(app: str = "photocraft") -> dict[str, Any]:
+        """List the documents open in a live desktop window.
+
+        :param app: App id (query param, default ``photocraft``).
+        :returns: ``{app, running, active, documents: [{index, name,
+            width?, height?, dirty, active}]}``.
+        :raises HTTPException: 400 unknown app, 502 app down / no documents.
+        """
+        if app not in LIVE_APPS:
+            raise HTTPException(status_code=400, detail=f"unknown app: {app}")
+        try:
+            documents, active = await owned.live.list_documents(app)
+        except LiveError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+        return {
+            "app": app,
+            "running": True,
+            "active": active,
+            "documents": [
+                {
+                    "index": doc.index,
+                    "name": doc.name,
+                    "width": doc.width,
+                    "height": doc.height,
+                    "dirty": doc.dirty,
+                    "active": doc.active,
+                }
+                for doc in documents
+            ],
+        }
+
+    @app.post("/api/live/launch")
+    async def live_launch(payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a down desktop app and wait for its control channel.
+
+        Spawns only the allowlisted GUI binaries (photocraft/gridcraft)
+        with fixed argv — no request data ever reaches the command line.
+        The token travels via a 0600 file and never into logs/responses.
+        Idempotent: an already-running app returns immediately.
+
+        Body: ``{app}``.
+        :param payload: ``{app}``.
+        :returns: ``{app, running, mode, pid}``.
+        :raises HTTPException: 400 unknown app, 409 app has no TCP
+            control channel (pdfcraft stays manual — hint included),
+            502 binary missing / spawn failed / channel silent past the
+            timeout (the app keeps starting; Refresh picks it up).
+        """
+        app = str(payload.get("app", "photocraft"))
+        if app not in LIVE_APPS:
+            raise HTTPException(status_code=400, detail=f"unknown app: {app}")
+        if app not in LAUNCHABLE_APPS:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": f"{app} has no TCP control channel — start it by hand",
+                    "hint": START_HINTS.get(app, ""),
+                },
+            )
+        try:
+            return await launch_app(owned.live, app)
+        except LiveError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+
+    @app.post("/api/live/attach", status_code=201)
+    async def live_attach(payload: dict[str, Any]) -> dict[str, Any]:
+        """Capture a live-window document as the chat object (import model).
+
+        Snapshots the window via ``ui.screenshot`` into the session work
+        dir and registers it as a normal photo document with
+        ``source="live"`` provenance. Chat, thumbnail, download, and the
+        agent edit loop then work unchanged — on the attached copy, never
+        on the user's live window.
+
+        Body: ``{session_id?, app, document?}`` — ``document`` is the
+        engine document index (defaults to the window's active document).
+
+        :param payload: ``{session_id?, app, document?}``.
+        :returns: Same shape as ``POST /api/files/open`` plus
+            ``source: "live"`` and ``live_app``.
+        :raises HTTPException: 400 unknown app/document, 502 app down or
+            uncapturable window (occluded windows stop rendering — focus
+            the app and retry).
+        """
+        session_id = str(payload.get("session_id", "default"))
+        app = str(payload.get("app", "photocraft"))
+        if app not in LIVE_APPS:
+            raise HTTPException(status_code=400, detail=f"unknown app: {app}")
+        raw_index = payload.get("document")
+        index: int | None = None
+        if raw_index is not None:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400, detail="document must be an index"
+                ) from None
+        work = owned.session_work_dir(session_id)
+        try:
+            documents, active = await owned.live.list_documents(app)
+        except LiveError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+        target = index if index is not None else active
+        if target is None:
+            target = documents[0].index
+        live_doc = next((d for d in documents if d.index == target), None)
+        if live_doc is None:
+            raise HTTPException(
+                status_code=400, detail=f"unknown live document: {target}"
+            )
+        try:
+            png = await owned.live.screenshot_png(app, document=live_doc.index)
+        except LiveError as exc:
+            message = str(exc)
+            if message.startswith("unknown live document"):
+                raise HTTPException(status_code=400, detail=message) from None
+            raise HTTPException(status_code=502, detail=message) from None
+        display = f"{live_doc.name} (live {app})"
+        staged = (
+            work
+            / f"live_{app}_{sanitize_filename(live_doc.name)}_{secrets.token_hex(4)}.png"
+        )
+        # Confine the staged path (defense in depth — work dir is in roots).
+        owned.check_session_path(session_id, staged)
+        staged.write_bytes(png)
+        registry = owned.registry_for(session_id)
+        try:
+            doc = PhotoAdapter(registry).open(staged, display)
+            evidence: dict[str, Any] = PhotoAdapter(registry).inspect(doc.doc_id)
+        except DocumentError as exc:
+            staged.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        doc.source = "live"
+        doc.live_app = app
+        doc.live_index = live_doc.index
+        log.info(
+            "live file attached: %s",
+            safe_event(event="live_attach", app=app, session_id=session_id, ok=True),
+        )
+        return {
+            "doc_id": doc.doc_id,
+            "kind": doc.kind,
+            "app": doc.kind,
+            "name": doc.source_name,
+            "source_name": doc.source_name,
+            "source": doc.source,
+            "live_app": doc.live_app,
+            "live_index": doc.live_index,
+            "session_id": session_id,
+            "thumbnail_url": f"/api/files/{doc.doc_id}/thumbnail?session_id={session_id}",
+            "work_path": str(doc.work_path),
+            "inspect": evidence,
+        }
 
     # -- verify: snapshot / restore / record-view (sidebar detail actions) ------
 

@@ -152,6 +152,46 @@ EOF
 #   across a resize and from any headless render_preview hash.
 ```
 
+## 6. CRAFTERS app wiring (controller + view, 2026-10-12)
+
+The gateway bridge above is now wired into the app the user sees:
+
+- **Gateway** (`gateway/main.py`): builds `BackendManager(bridges=…)` from
+  `CRAFTER_BRIDGE_<APP>` env (per-app fault isolation — one malformed var
+  is skipped loudly, the rest stay live). No env vars = headless CLI mode,
+  exactly as before.
+- **Controller** (`controller/live.py`, `GET /api/live/status`,
+  `GET /api/live/documents`, `POST /api/live/attach`): probes the control
+  channel, lists open documents (`ui.inspect.session.documents`, active
+  index), and attaches a document as the chat object. Attach is an
+  **import**: the window is snapshotted via `ui.screenshot` into the
+  session work dir and registered as a normal photo doc with
+  `source="live"` provenance — chat, thumbnail, download, snapshot/restore
+  and the agent edit loop work unchanged, on the copy, never on the live
+  window. Errors are honest: down app → 502 naming the `--control`
+  command; occluded window → 502 (focus the app and retry).
+- **View** (`LiveApp.tsx`, section *3 · Live app window*): status rows with
+  Refresh, per-app open-document list, *Use as chat object* (binds chat
+  like an upload; the opened-file header badges `live window (photocraft)`),
+  and — for TCP apps that are down — a **Launch** button
+  (`POST /api/live/launch`, `controller/live.py::launch_app`): the
+  controller spawns the allowlisted desktop binary with fixed argv (token
+  via a 0600 file, never logged), registers its control channel, and polls
+  until it answers. pdfcraft has no TCP channel, so it stays manual-entry
+  only (409 with the hint). Desktop binaries resolve via
+  `CRAFTER_DESKTOP_<APP>` or `PATH` (`start.sh` exports them when found);
+  missing binary → honest 502 + the copy-paste start command.
+
+Verified: `controller/tests/test_live.py` (14 tests, wire-format stub with
+photocraft-style auth) + `LiveApp.test.tsx` (3 tests) + live smoke test
+through real processes (status → documents → attach → mock chat
+`response.completed`). Full suites: 288 Python + 77 view green.
+
+To test with a real window: build the desktop binary
+(`cargo build --release --bin photocraft` in `photocraft-main`), start it
+per §5 step 1, export the two `CRAFTER_BRIDGE_PHOTOCRAFT*` vars, then
+`./start.sh`.
+
 Troubleshooting: connection refused → app not started with `--control`;
 auth rejected → token file mismatch (photocraft rotates only when the file
 is absent — keep the file); timeouts on healthy app → window occluded /

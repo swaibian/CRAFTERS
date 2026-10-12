@@ -85,6 +85,36 @@ if [[ -z "${CRAFTER_DEV_TOKEN:-}" ]]; then
 fi
 export CRAFTER_WORK_DIR="$WORK_DIR"
 
+# -- Live desktop apps (Lane 3, optional) -------------------------------------
+# Two ways to get a live window into the picker (3 · Live app window):
+#
+#   A. Press the per-app Launch button in the UI — the controller starts the
+#      desktop binary itself (needs it on PATH or CRAFTER_DESKTOP_<APP> set,
+#      see below) and registers its control channel, no restart needed.
+#      pdfcraft has no TCP control channel — start it by hand, drop the PDF.
+#
+#   B. Start a Craft app with its control channel by hand, then export the
+#      matching vars BEFORE ./start.sh so the controller picker and the
+#      gateway bridge see the live window:
+#   photocraft --control 7878 --control-token-file /tmp/pc.token \
+#     --automation-read-root "$WORK_DIR" --automation-write-root "$WORK_DIR" &
+#   export CRAFTER_BRIDGE_PHOTOCRAFT=127.0.0.1:7878
+#   export CRAFTER_BRIDGE_PHOTOCRAFT_TOKEN_FILE=/tmp/pc.token
+#   gridcraft --control 7979 &
+#   export CRAFTER_BRIDGE_GRIDCRAFT=127.0.0.1:7979
+# (pdfcraft has no TCP control channel — drop the PDF file instead.)
+#
+# For path A, point the controller at the desktop binaries (built with e.g.
+# `cargo build --release -p photocraft` in the app source checkout):
+for _app in photocraft gridcraft; do
+  _var="CRAFTER_DESKTOP_$(printf '%s' "$_app" | tr '[:lower:]' '[:upper:]')"
+  if [[ -z "${!_var:-}" ]] && have "$_app"; then
+    export "$_var"="$(command -v "$_app")"
+    echo "→ live launch: $_app at ${!_var}"
+  fi
+done
+unset _app _var
+
 PIDS=()
 CLEANING_UP=0
 cleanup() {

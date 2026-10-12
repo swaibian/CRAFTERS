@@ -33,9 +33,9 @@ view/.vite/
 .local-run/
 controller/work/
 *.log
-
+deploy/local-bin-paths.env
 # --- IDE & editors ---
-.vscode/settings.json
+
 .idea/
 *.swp
 *.swo
@@ -43,3 +43,4 @@ controller/work/
 # --- OS ---
 Thumbs.db
 ._*
+deploy/local-bin-paths.env

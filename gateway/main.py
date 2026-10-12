@@ -202,8 +202,27 @@ def main(argv: list[str] | None = None) -> None:
         root.mkdir(parents=True, exist_ok=True)
         sessions = SessionRegistry(default_roots=[root])
         sessions.create("default", "local", key_id="key_local")
+    try:
+        from .bridge import BridgeError, bridges_from_env
+    except ImportError:
+        bridges_from_env = None  # type: ignore[assignment]
+        BridgeError = Exception  # type: ignore[assignment, misc]
+    bridges: dict = {}
+    if bridges_from_env is not None:
+        # Per-app fault isolation: one malformed CRAFTER_BRIDGE_* var must
+        # not take the healthy bridges down with it (serve headless/CLI
+        # mode for the rest, and say so loudly).
+        from .backends import PILOT_APPS
+
+        for _app in PILOT_APPS:
+            try:
+                bridges.update(bridges_from_env((_app,)))
+            except BridgeError as exc:
+                print(f"crafter-gateway: ignoring bridge config ({exc})")
+
     mcp = create_gateway(
         require_auth=not args.open_auth,
+        backend_manager=BackendManager(bridges=bridges),
         sessions=sessions,
     )
     for line in provision_tokens(
