@@ -79,7 +79,7 @@ export interface ChatStreamRequest {
 /** SSE events per send_task_stream contract. */
 export type StreamEvent =
   | { type: 'response.started'; run_id: string; model: string; team: string | null }
-  | { type: 'text.delta'; delta: string }
+  | { type: 'text.delta'; delta: string; phase?: 'reasoning' | 'final' }
   | { type: 'tool.call'; name: string; args: Record<string, unknown> }
   | { type: 'tool.result'; name: string; ok: boolean; summary: string }
   | { type: 'response.completed'; message_id: string }
@@ -444,7 +444,11 @@ export function parseStreamPayload(raw: string, eventName?: string): StreamEvent
         team: parsed.team == null ? null : String(parsed.team),
       };
     case 'text.delta':
-      return { type: 'text.delta', delta: String(parsed.delta ?? '') };
+      return {
+        type: 'text.delta',
+        delta: String(parsed.delta ?? ''),
+        ...(parsed.phase === 'reasoning' || parsed.phase === 'final' ? { phase: parsed.phase } : {}),
+      };
     case 'tool.call':
       return {
         type: 'tool.call',

@@ -44,6 +44,11 @@ describe('parseStreamPayload', () => {
       type: 'text.delta',
       delta: 'hi',
     });
+    expect(parseStreamPayload(JSON.stringify({ event: 'text.delta', delta: 'plan', phase: 'reasoning' }))).toEqual({
+      type: 'text.delta',
+      delta: 'plan',
+      phase: 'reasoning',
+    });
     expect(
       parseStreamPayload(JSON.stringify({ event: 'tool.call', name: 'craft_look', args: { a: 1 } })),
     ).toEqual({ type: 'tool.call', name: 'craft_look', args: { a: 1 } });

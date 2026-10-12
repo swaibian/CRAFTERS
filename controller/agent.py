@@ -11,7 +11,7 @@ Given a user message + open document + brain (LLM or MockBrain), the loop:
 3. **see** — re-read the doc (adapter ``inspect``, or ``document.inspect``
    on the live lane = observation);
 4. **reason** — check the observation against the request; on mismatch, plan
-   the next step (max ``max_iterations``, default 8);
+   the next step (max ``max_iterations``, default 32);
 5. **record** — a craft_record-style claim ledger per run (every claim needs
    evidence: revision refs + content hashes).
 
@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .commands import CommandCatalog
 from .documents import (
     DocumentError,
     DocumentRegistry,
@@ -55,7 +57,29 @@ from .logger import get_logger, safe_event
 
 log = get_logger()
 
-MAX_ITERATIONS = 8
+MAX_ITERATIONS = 32
+
+#: Tools whose effect applies to the document — an identical repeat would
+#: apply it twice (rotating again, writing the cell again).
+MUTATING_TOOLS = frozenset(
+    {
+        "command_run",
+        "doc_save",
+        "photo.transform",
+        "pdf.transform",
+        "sheet.set_cell",
+        "sheet.add_sheet",
+    }
+)
+
+#: Mutating tools whose identical repeat is refused anywhere in one run
+#: (non-idempotent: rotation/filter commands, page ops). ``doc_save`` is
+#: excluded — re-saving the same file is harmless.
+RUN_GUARD_TOOLS = MUTATING_TOOLS - {"doc_save"}
+
+#: A bare registry-style command id (``image.imageRotation.90cw``); anything
+#: else in ``command_run`` is a double-wrapped envelope, not an id.
+_COMMAND_ID_RE = re.compile(r"^[A-Za-z_][\w.]*$")
 
 
 @dataclass
@@ -80,7 +104,7 @@ class AgentRun:
 
     :param run_id: Stable run id (``run_<hex>``).
     :param session_id: Owning session (logging only).
-    :param max_iterations: Plan→act→observe budget (default 8).
+    :param max_iterations: Plan→act→observe budget (default 32).
     """
 
     run_id: str
@@ -196,16 +220,22 @@ def brain_from_profile(
                 f"You operate the user's open {live_app or 'desktop app'} document "
                 "in the live desktop app via its command surface. Every command "
                 "you run is applied to the document the user sees in the open "
-                "window — the effect is visible there immediately. Use "
-                "command_list to discover the app's functionality (the full "
-                "engine registry with parameter docs), command_run to run any "
-                "command (e.g. image.imageRotationcw rotates 90 degrees "
-                "clockwise), and look / doc_inspect to verify the result. Use "
-                "doc_save ONLY when the user explicitly asks to save — visible "
-                "edits need no save. Act with tool calls, then call done with a "
-                "summary. When the user asks a question about the document "
-                "(dimensions, layers, state), answer from look / doc_inspect "
-                "with a done call — do not transform the document."
+                "window — the effect is visible there immediately. Follow this "
+                "workflow on every request: 1) understand what the user wants "
+                "changed; 2) call command_list with short keywords (e.g. 'blend', "
+                "'duplicate', 'opacity', 'filter') to discover the exact command "
+                "ids and their params — the registry contains everything the app "
+                "can do: layers (duplicate, move, merge), blend modes (Multiply, "
+                "Screen, … as PARAM VALUES of one layer command, never separate "
+                "ids), opacity, transforms, filters, adjustments, text, "
+                "selection; 3) call command_run with the exact id you found (ids "
+                "look like image.imageRotation.90cw) — never invent ids; "
+                "4) verify with look / doc_inspect; 5) call doc_save ONLY when "
+                "the user explicitly asks to save — visible edits need no save; "
+                "6) finish with done carrying a summary of what changed. When "
+                "the user asks a question about the document (dimensions, layers, "
+                "state), answer from look / doc_inspect with a done call — do "
+                "not transform the document."
             )
         else:
             system = (
@@ -242,6 +272,7 @@ async def run_agent_loop(
     max_iterations: int = MAX_ITERATIONS,
     executor: LiveExecutor | None = None,
     live_app: str = "",
+    catalog: CommandCatalog | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run do → see → reason → change until finished (async event generator).
 
@@ -256,6 +287,9 @@ async def run_agent_loop(
     :param executor: Live executor driving the user's OPEN desktop document
         (None = adapter mode on the imported work dir copy).
     :param live_app: App id the executor drives (logging only).
+    :param catalog: Command registry the app exposes (live lane) — used to
+        suggest nearest ids when the app rejects a command (None = no
+        suggestions).
     :yields: Loop events: ``run.started`` (run_id, model, mock), ``plan``
         (text, calls), ``tool.call`` (name, call_id), ``tool.result`` (ok,
         evidence summary), ``observe`` (inspection summary), ``record``
@@ -336,11 +370,22 @@ async def run_agent_loop(
         yield {"type": "plan", "text": current_text, "calls": []}
 
     final_summary = current_text
+    last_call_key: tuple[str, str] = ("", "")
+    same_call_streak = 0
+    step_summaries: list[str] = []
+    prev_observation: dict[str, Any] | None = None
+    mutation_effects: dict[tuple[str, str], bool] = {}
+    last_look_hash: str | None = None
     while iteration < max_iterations:
         if not pending:
             break
         iteration += 1
         call = pending.pop(0)
+        call_key = (
+            call.name,
+            json.dumps(call.arguments, sort_keys=True, default=str),
+        )
+        same_call_streak = same_call_streak + 1 if call_key == last_call_key else 1
         log.info(
             "agent tool call: %s",
             safe_event(
@@ -358,17 +403,77 @@ async def run_agent_loop(
             "arguments": dict(call.arguments),
             "iteration": iteration,
         }
-        try:
-            if executor is not None:
-                evidence = await _execute_live_call(call, executor)
-            else:
-                evidence = _execute_call(call, doc_id, sheets, photos, pdfs)
-            ok = True
-            error = ""
-        except (DocumentError, ValueError, LiveError) as exc:
+        repeat = call_key == last_call_key and call.name != "done"
+        repeated_edit = repeat and call.name in MUTATING_TOOLS
+        already_applied = call.name in RUN_GUARD_TOOLS and call_key in mutation_effects
+        # Read-only calls (command_list/doc_inspect/look) are never refused —
+        # repeating them wastes budget but must not kill the run the way the
+        # old 3-strikes rule did ("I could not complete that step" on a
+        # discovery call). Only mutations are double-applied hazards.
+        repeated_too_much = (
+            repeat and same_call_streak > 2 and call.name in MUTATING_TOOLS
+        )
+        if repeated_edit or repeated_too_much or already_applied:
+            # Identical mutating call twice would apply the change twice
+            # (e.g. rotating again); any call three times in a row is a
+            # planning loop (e.g. re-listing commands). Stop honestly
+            # instead of corrupting the document or burning the budget.
             evidence = {}
             ok = False
-            error = str(exc)
+            if already_applied:
+                error = (
+                    f"{call.name} with these exact arguments was already "
+                    "applied earlier in this run — running it again would "
+                    "apply the change twice (e.g. rotate again); call done "
+                    "if the request is satisfied, or use different arguments"
+                )
+            else:
+                error = (
+                    f"{call.name} was already run with these arguments — "
+                    "repeating it would change nothing new (or apply the edit "
+                    "twice); call done or pick a different command"
+                )
+        else:
+            if call.name in RUN_GUARD_TOOLS and prev_observation is None:
+                # Baseline before the first edit so the after-state diff is
+                # a real "did my edit land?" verdict, not a blind first look.
+                if executor is not None:
+                    prev_observation = await _observe_live(executor)
+                else:
+                    prev_observation = _observe(doc_id, registry, sheets, photos, pdfs)
+            try:
+                if executor is not None:
+                    evidence = await _execute_live_call(call, executor)
+                else:
+                    evidence = _execute_call(call, doc_id, sheets, photos, pdfs)
+                ok = True
+                error = ""
+            except (DocumentError, ValueError, LiveError) as exc:
+                evidence = {}
+                ok = False
+                error = str(exc)
+                if (
+                    catalog is not None
+                    and call.name == "command_run"
+                    and "unknown command" in error.lower()
+                ):
+                    hints = catalog.suggest(_attempted_command_id(call.arguments))
+                    if hints:
+                        error += (
+                            " — did you mean: "
+                            + ", ".join(hints)
+                            + "? Use command_list to discover ids."
+                        )
+        last_call_key = call_key
+        if ok and call.name in RUN_GUARD_TOOLS:
+            mutation_effects[call_key] = True
+        if ok and call.name == "look" and isinstance(evidence, dict):
+            shot_hash = evidence.get("sha256")
+            if isinstance(shot_hash, str):
+                evidence["changed"] = (
+                    None if last_look_hash is None else shot_hash != last_look_hash
+                )
+                last_look_hash = shot_hash
         yield {
             "type": "tool.result",
             "name": call.name,
@@ -416,18 +521,46 @@ async def run_agent_loop(
                 "record_id": run.ledger[-1].record_id,
                 "confidence": "inferred",
             }
-            final_summary = f"I could not complete that step ({call.name}: {error})."
+            if already_applied or repeated_edit:
+                final_summary = (
+                    f"Stopped: {call.name} would have applied the same edit "
+                    "a second time — the earlier application stands."
+                )
+            elif repeated_too_much:
+                final_summary = (
+                    f"Stopped: {call.name} was repeated without progress — "
+                    "nothing new to report."
+                )
+            else:
+                final_summary = (
+                    f"I could not complete that step ({call.name}: {error})."
+                )
             break
         # SEE: re-read the doc = observation; REASON: verify against request.
         if executor is not None:
             observation = await _observe_live(executor)
         else:
             observation = _observe(doc_id, registry, sheets, photos, pdfs)
-        yield {"type": "observe", "observation": observation, "iteration": iteration}
+        changed = _state_changed(prev_observation, observation)
+        previous_hint = _revision_hint(prev_observation)
+        yield {
+            "type": "observe",
+            "observation": observation,
+            "changed": changed,
+            "iteration": iteration,
+        }
         refs = _evidence_refs(evidence, observation)
         confidence = "measured" if refs else "inferred"
+        if call.name in MUTATING_TOOLS:
+            claim = (
+                f"{call.name} applied and verified"
+                if changed is not False
+                else f"{call.name} ran but the document state did not change"
+            )
+        else:
+            claim = f"{call.name} completed"
         entry = run.record(
-            f"{call.name} applied and verified",
+            claim,
             confidence,
             refs if refs else [{"kind": "revision", "revision": iteration}],
         )
@@ -437,14 +570,22 @@ async def run_agent_loop(
             "confidence": confidence,
         }
         final_summary = _summarize(call, evidence)
+        step_summaries.append(final_summary)
+        prev_observation = observation
         # Ask the brain whether more steps are needed (follow-up plan).
         if pending:
             continue
+        steps_line = " ".join(f"{i + 1}) {s}" for i, s in enumerate(step_summaries))
         try:
             followup = plan_fn(
-                f"Done so far: {final_summary}. Original request: {message}. "
-                "Reply with a done call carrying the final summary, or more "
-                "tool calls if work remains.",
+                f"Done so far: {steps_line} {_evidence_hint(evidence)} "
+                f"Original request: {message}. "
+                f"Current document state: "
+                f"{_state_line(observation, changed, previous=previous_hint, mutated=call.name in MUTATING_TOOLS)}. "
+                "If the state already satisfies the request, reply with a "
+                "done call carrying the final summary — never repeat an edit "
+                "that already landed. Otherwise reply with the next tool "
+                "calls (discover ids with command_list first).",
                 doc_kind,
             )
         except LlmError:
@@ -463,7 +604,11 @@ async def run_agent_loop(
             break
 
     if iteration >= max_iterations and pending:
-        final_summary += " (stopped at the iteration budget; work may remain)."
+        recap = " ".join(step_summaries) if step_summaries else final_summary
+        final_summary = (
+            f"{recap} (stopped at the iteration budget after {iteration} "
+            "steps; work may remain)."
+        )
     duration_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "agent run completed: %s",
@@ -532,39 +677,163 @@ def _execute_call(
     raise DocumentError(f"unknown tool: {call.name}")
 
 
+def _unwrap_command_value(value: Any) -> Any:
+    """Peel one double-wrapped ``command_run`` envelope layer.
+
+    LLMs occasionally wrap the call (upstream MCP spells the arg ``id``, or
+    the whole ``{"command": ..., "params": ...}`` envelope lands in the
+    ``command`` value — even as a JSON string). One step unwraps dicts
+    carrying ``command``/``id`` and JSON-object strings of the same shape.
+
+    :param value: Current candidate value.
+    :returns: The inner candidate, or ``value`` when no envelope is present.
+    """
+    if isinstance(value, dict):
+        inner = value.get("command")
+        if inner is None:
+            inner = value.get("id")
+        return value if inner is None else inner
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except ValueError:
+                return value
+            if isinstance(parsed, dict):
+                return parsed
+    return value
+
+
+def _normalize_command_run_args(
+    arguments: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Unwrap one ``command_run`` argument mapping into ``(command_id, params)``.
+
+    Accepts ``command`` or ``id``; the value may itself be a
+    ``{"command": ..., "params": ...}`` / ``{"id": ...}`` envelope or a JSON
+    string of one (unwrapped iteratively). Params follow the innermost
+    envelope that carries them, else the top-level ``params`` object.
+
+    :param arguments: Raw tool-call arguments.
+    :returns: ``(bare command id, params dict or None)``.
+    :raises DocumentError: No recognizable id, or the id is not bare
+        registry style (``^[A-Za-z_][\\w.]*$``).
+    """
+    original: Any = arguments.get("command")
+    if original is None:
+        original = arguments.get("id")
+    raw: Any = original
+    params: Any = arguments.get("params")
+    for _ in range(4):
+        if isinstance(raw, dict):
+            nested = raw.get("params")
+            if isinstance(nested, dict):
+                params = nested
+        unwrapped = _unwrap_command_value(raw)
+        if unwrapped is raw:
+            if isinstance(raw, dict):
+                raw = None
+            break
+        raw = unwrapped
+    command = raw.strip() if isinstance(raw, str) else ""
+    if not _COMMAND_ID_RE.match(command):
+        got = command if command else str(original)[:60]
+        raise DocumentError(
+            "command_run needs a bare command id (e.g. image.imageRotation.90cw) "
+            "— list ids with command_list; got: " + got[:60]
+        )
+    return command, params if isinstance(params, dict) else None
+
+
+def _attempted_command_id(arguments: dict[str, Any]) -> str:
+    """Best-effort id the planner sent (for suggestion hints; never raises)."""
+    try:
+        command, _params = _normalize_command_run_args(arguments)
+        return command
+    except DocumentError:
+        raw = arguments.get("command", arguments.get("id"))
+        return str(raw)[:60] if raw is not None else ""
+
+
 async def _execute_live_call(call: ToolCall, executor: LiveExecutor) -> dict[str, Any]:
     """Execute one tool call against the live desktop app (raises on failure).
 
     Dispatches the :data:`~controller.llm.LIVE_APP_TOOLS` names onto the
     :class:`~controller.live.LiveExecutor` — never onto the document
     adapters (the live lane must not touch the imported copy).
+    ``command_run`` arguments are normalized first (``command`` or ``id``,
+    nested/stringified envelopes unwrapped) so a double-wrapped call fails
+    with one clear hint instead of an app-side "unknown command" wall.
+    ``command_list`` filters client-side (the desktop ``engine.commands``
+    ignores its ``filter`` param and always answers the whole registry) —
+    ranked through :class:`~controller.commands.CommandCatalog` built
+    from the fetched entries, with the params schema kept for the planner.
 
     :param call: Parsed tool call.
     :param executor: Live executor for the linked open document.
     :returns: Minimal evidence (op names/counts/hashes — never pixels or
-        command params).
-    :raises DocumentError: Unknown tool.
+        file content).
+    :raises DocumentError: Unknown tool or non-bare command id.
     :raises LiveError: App down or the app refused the call (honest text).
     """
     if call.name == "done":
         return {"summary": call.arguments.get("summary", "")}
     args = call.arguments
     if call.name == "command_run":
-        raw_params = args.get("params")
-        params = raw_params if isinstance(raw_params, dict) else None
-        command = str(args.get("command", ""))
-        await executor.execute(command, params)
+        command, params = _normalize_command_run_args(args)
+        await executor.execute(command, params or {})
         return {"op": command}
     if call.name == "command_list":
         raw_filter = args.get("filter")
-        result = await executor.commands(
-            str(raw_filter) if raw_filter is not None else None
-        )
+        filter_text = str(raw_filter).strip() if raw_filter is not None else ""
+        result = await executor.commands(filter_text or None)
         commands = result.get("commands") if isinstance(result, dict) else None
-        return {"count": len(commands) if isinstance(commands, list) else 0}
+        entries = (
+            [e for e in commands if isinstance(e, dict) and e.get("id")]
+            if isinstance(commands, list)
+            else []
+        )
+        total = len(entries)
+        if filter_text:
+            # Filter client-side: the desktop ignores `filter`, and the
+            # registry's own substring semantics cannot match "rotate" to
+            # "image.imageRotation…" — the catalog's ranked search can.
+            # Always index the FETCHED entries (they are the app's true
+            # registry; a catalog fetched earlier may be stale or from a
+            # different fixture).
+            keep = {
+                e["id"] for e in CommandCatalog(entries).search(filter_text, limit=50)
+            }
+            matched = [e for e in entries if e["id"] in keep]
+        else:
+            matched = entries
+        listed: list[dict[str, str]] = []
+        for entry in matched:
+            # Params schema rides along: the planner must learn HOW to call
+            # an id (e.g. curves takes {"points": [[in,out],…]}) — a bare
+            # id+label listing cannot support "reduce the highlights".
+            raw_params = entry.get("params")
+            params_doc = str(raw_params) if raw_params is not None else ""
+            listed.append(
+                {
+                    "id": str(entry.get("id", "")),
+                    "label": str(entry.get("label") or entry.get("name") or ""),
+                    "params": params_doc[:160],
+                }
+            )
+        evidence: dict[str, Any] = {
+            "count": len(matched),
+            "total": total,
+            "filter": filter_text,
+            "ids": [e["id"] for e in listed],
+            "entries": listed,
+        }
+        return evidence
     if call.name == "doc_inspect":
-        await executor.inspect()
-        return {"op": "document.inspect"}
+        info = await executor.inspect()
+        detail = _live_detail(info) if isinstance(info, dict) else {}
+        return {"op": "document.inspect", "detail": detail}
     if call.name == "doc_save":
         raw_path = args.get("path")
         result = await executor.save(str(raw_path) if raw_path is not None else None)
@@ -626,12 +895,74 @@ def _observe(
     }
 
 
+def _live_detail(info: dict[str, Any]) -> dict[str, Any]:
+    """Compact document summary from a ``document.inspect`` payload.
+
+    Keeps counts/dims plus a one-line-per-layer stack summary (name, kind,
+    blend, opacity) so the planner can verify layer-level requests
+    (duplicate, blend mode, reorder). Never includes pixels or layer
+    content.
+
+    :param info: Raw ``document.inspect`` payload.
+    :returns: ``{width, height, layers, history, layer_summary}`` — only
+        the keys that parsed.
+    """
+    detail: dict[str, Any] = {}
+    for key in ("width", "height"):
+        value = _optional_count(info.get(key))
+        if value is not None:
+            detail[key] = value
+    layers = info.get("layers")
+    if isinstance(layers, list):
+        detail["layers"] = len(layers)
+        stack = _layer_summary(layers)
+        if stack:
+            detail["layer_summary"] = stack
+    history = info.get("history")
+    if isinstance(history, list):
+        detail["history"] = len(history)
+    return detail
+
+
+def _layer_summary(layers: list[Any], limit: int = 12) -> list[str]:
+    """Flatten a layer tree into short ``name (kind, blend, opacity%)`` lines.
+
+    :param layers: Layer node list from ``document.inspect`` (may nest
+        ``children``).
+    :param limit: Maximum lines (guard against huge documents).
+    :returns: One line per layer, outermost first.
+    """
+    lines: list[str] = []
+
+    def _walk(nodes: list[Any]) -> None:
+        for node in nodes:
+            if len(lines) >= limit:
+                return
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name") or node.get("kind") or "?")[:40]
+            kind = str(node.get("kind") or "")
+            blend = str(node.get("blend") or "")
+            opacity = node.get("opacity")
+            pieces = [p for p in (kind, blend) if p]
+            if isinstance(opacity, (int, float)) and not isinstance(opacity, bool):
+                pieces.append(f"{opacity:g}%")
+            suffix = f" ({', '.join(pieces)})" if pieces else ""
+            lines.append(f"{name}{suffix}")
+            children = node.get("children")
+            if isinstance(children, list):
+                _walk(children)
+
+    _walk(layers)
+    return lines
+
+
 async def _observe_live(executor: LiveExecutor) -> dict[str, Any]:
     """Re-read the live document into a log-safe observation summary.
 
     Runs ``document.inspect`` through the executor and keeps counts/dims
-    only — layer names, history entries, pixels and the raw payload never
-    reach the observation or the logs.
+    plus layer names/blends (needed to verify layer-level edits) — pixels
+    and layer content never reach the observation or the logs.
 
     :param executor: Live executor for the linked open document.
     :returns: ``{kind: "live", app, revision, content_hash, detail}`` where
@@ -644,15 +975,7 @@ async def _observe_live(executor: LiveExecutor) -> dict[str, Any]:
         return {"kind": "live", "app": executor.app, "detail": "inspect failed"}
     if not isinstance(info, dict):
         return {"kind": "live", "app": executor.app, "detail": "inspect unreadable"}
-    detail: dict[str, Any] = {}
-    for key in ("width", "height"):
-        value = _optional_count(info.get(key))
-        if value is not None:
-            detail[key] = value
-    for key in ("layers", "history"):
-        entries = info.get(key)
-        if isinstance(entries, list):
-            detail[key] = len(entries)
+    detail = _live_detail(info)
     observation: dict[str, Any] = {
         "kind": "live",
         "app": executor.app,
@@ -698,6 +1021,154 @@ def _evidence_refs(
     return refs
 
 
+def _state_changed(
+    before: dict[str, Any] | None, after: dict[str, Any] | None
+) -> bool | None:
+    """Whether the document state moved between two observations.
+
+    Compares the inspect hash (includes history) then the summary
+    fields — the planner's proof that an edit actually landed.
+
+    :param before: Previous observation (None on the first step).
+    :param after: Current observation.
+    :returns: True/False when both sides are known, else None.
+    """
+    if not before or not after:
+        return None
+    old_hash, new_hash = before.get("content_hash"), after.get("content_hash")
+    if old_hash and new_hash:
+        return old_hash != new_hash
+    return before.get("detail") != after.get("detail") or (
+        before.get("revision") != after.get("revision")
+    )
+
+
+def _state_line(
+    observation: dict[str, Any],
+    changed: bool | None,
+    *,
+    previous: str = "",
+    mutated: bool = True,
+) -> str:
+    """One-line document state (plus change verdict) for the planner.
+
+    :param observation: Latest observation dict.
+    :param changed: Verdict from :func:`_state_changed`.
+    :param previous: Short label of the earlier state (e.g. ``"history 2"``).
+    :param mutated: Whether the last step was an edit (read-only steps
+        must not be blamed for "no visible effect").
+    :returns: e.g. ``48x32 px, 2 layers, history 3 (changed since the
+        previous step — the edit landed)``.
+    """
+    detail = observation.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    bits = []
+    if "width" in detail and "height" in detail:
+        bits.append(f"{detail['width']}x{detail['height']} px")
+    if "layers" in detail:
+        bits.append(f"{detail['layers']} layers")
+    names = detail.get("layer_summary")
+    if isinstance(names, list) and names:
+        bits.append("layer stack: " + "; ".join(str(n) for n in names[:12]))
+    revision = observation.get("revision")
+    if revision is not None:
+        bits.append(f"history {revision}")
+    state = ", ".join(bits) or "unknown"
+    if changed is True:
+        verdict = "changed since the previous step — the edit landed"
+        if previous:
+            verdict += f" (was {previous})"
+    elif changed is False:
+        if mutated:
+            verdict = (
+                "UNCHANGED since the previous step — the edit did NOT land; "
+                "verify the command id/params before retrying"
+            )
+        else:
+            verdict = "unchanged since the previous step (read-only step)"
+    else:
+        verdict = "first state reading of this run"
+    return f"{state} ({verdict})"
+
+
+def _revision_hint(observation: dict[str, Any] | None) -> str:
+    """Short label of an observation's revision (for change verdicts)."""
+    if not observation:
+        return ""
+    revision = observation.get("revision")
+    return f"history {revision}" if revision is not None else ""
+
+
+def _entry_line(entry: dict[str, Any]) -> str:
+    """One registry entry as ``id (label; params schema)`` for prompts."""
+    command_id = str(entry.get("id") or "?")
+    label = str(entry.get("label") or "")
+    params = str(entry.get("params") or "").strip()
+    bits = [b for b in (label, params) if b]
+    return f"{command_id} ({'; '.join(bits)})" if bits else command_id
+
+
+def _evidence_hint(evidence: dict[str, Any]) -> str:
+    """Compact tool-result hint for the follow-up planner prompt.
+
+    Surfaces what the tool actually returned (``command_list`` hits as
+    ``id (label; params schema)`` entries capped at 12 so the planner can
+    pick the right registry id AND form its arguments (e.g. curves needs
+    ``{"points": [[in,out],…]}``), saved path from ``doc_save``, …) instead
+    of blindly repeating the call. Params SCHEMAS are included; pixels and
+    file content never are.
+
+    :param evidence: Evidence dict from the executed call.
+    :returns: One short sentence (``""`` when there is nothing to add).
+    """
+    entries = evidence.get("entries")
+    if isinstance(entries, list) and entries:
+        shown = ", ".join(_entry_line(e) for e in entries[:12] if isinstance(e, dict))
+        more = "" if len(entries) <= 12 else f", … ({len(entries) - 12} more)"
+        count = evidence.get("count", len(entries))
+        total = evidence.get("total", count)
+        filter_text = str(evidence.get("filter") or "")
+        scope = f"matching '{filter_text}'" if filter_text else "in the registry"
+        return (
+            f"Commands {scope} ({count} of {total}): {shown}{more}. "
+            "Run one with command_run, passing params per its schema (omit "
+            "params when the schema is empty), or refine the filter."
+        )
+    if evidence.get("entries") == [] and evidence.get("filter"):
+        return (
+            f"No commands match filter '{evidence['filter']}' — try a "
+            "different keyword or command_list without a filter."
+        )
+    ids = evidence.get("ids")
+    if isinstance(ids, list) and ids:
+        shown = ", ".join(str(i) for i in ids[:40])
+        more = "" if len(ids) <= 40 else f", … ({len(ids) - 40} more)"
+        return f"Available commands include: {shown}{more}."
+    path = evidence.get("path")
+    if path:
+        return f"Saved to: {path}."
+    detail = evidence.get("detail")
+    if isinstance(detail, dict) and detail:
+        bits = []
+        if "width" in detail and "height" in detail:
+            bits.append(f"{detail['width']}x{detail['height']} px")
+        if "layers" in detail:
+            bits.append(f"{detail['layers']} layers")
+        names = detail.get("layer_summary")
+        if isinstance(names, list) and names:
+            bits.append("stack: " + "; ".join(str(n) for n in names[:12]))
+        if bits:
+            return "Document reads: " + ", ".join(bits) + "."
+    if evidence.get("changed") is True:
+        return "Window pixels changed since the previous look."
+    if evidence.get("changed") is False:
+        return (
+            "Window pixels are UNCHANGED since the previous look — the "
+            "edit may not be visible (or the window is stale)."
+        )
+    return ""
+
+
 def _summarize(call: ToolCall, evidence: dict[str, Any]) -> str:
     """Human summary of one applied op (no content echoed)."""
     if call.name == "done":
@@ -713,12 +1184,24 @@ def _summarize(call: ToolCall, evidence: dict[str, Any]) -> str:
     if call.name == "command_run":
         return f"Ran {op} in the open app."
     if call.name == "command_list":
-        return f"Listed {evidence.get('count', 0)} app commands."
+        count = evidence.get("count", 0)
+        total = evidence.get("total", count)
+        filter_text = str(evidence.get("filter") or "")
+        if filter_text:
+            return f"Listed {count} of {total} commands matching '{filter_text}'."
+        return f"Listed {count} app commands."
     if call.name == "doc_inspect":
         return "Inspected the open app document."
     if call.name == "doc_save":
         return f"Saved the open app document ({evidence.get('path', 'own file')})."
     if call.name == "look":
+        if evidence.get("changed") is True:
+            return f"Looked at the live window ({evidence.get('bytes', 0)} bytes; pixels changed)."
+        if evidence.get("changed") is False:
+            return (
+                f"Looked at the live window ({evidence.get('bytes', 0)} bytes; "
+                "pixels UNCHANGED since the previous look)."
+            )
         return f"Looked at the live window ({evidence.get('bytes', 0)} bytes)."
     return f"Applied {op}."
 

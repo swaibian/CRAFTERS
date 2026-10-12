@@ -2,15 +2,25 @@
  * ToolcallView (TC-A-02): inline toolcall blocks + right collapsible detail.
  *
  * Why (story #2, #7): users must see do/see/reason steps and trust agent
- * edits. Args render redacted (secret-looking keys hidden); verify actions
- * (Snapshot / Restore / Record view) call POST /api/verify/* when present,
- * else render disabled with a tooltip and fall back to chat commands.
+ * edits. Args render compactly and redacted (secret-looking keys hidden):
+ * a `command` arg shows inline after the tool name (`command_run
+ * image.imageRotation.90cw`), every other arg is one `key: value` line —
+ * never a raw JSON blob. Verify actions (Snapshot / Restore / Record view)
+ * call POST /api/verify/* when present, else render disabled with a tooltip
+ * and fall back to chat commands.
  */
 
 import { useState } from 'react';
 import { VERIFY_ACTIONS, runVerifyAction } from '../lib/api';
 import { redactArgs, type ToolCallBlock } from '../lib/chat';
 import { logger } from '../lib/logger';
+
+/** One arg value as a single compact line (scalars bare, objects JSON). */
+function formatArgValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value !== null && typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
 
 export function ToolcallBlockView({
   block,
@@ -53,6 +63,9 @@ export function ToolcallBlockView({
   }
 
   const statusLabel = block.status === 'running' ? 'running' : block.status === 'done' ? 'ok' : 'error';
+  const redacted = redactArgs(block.args);
+  const command = typeof redacted.command === 'string' ? redacted.command : null;
+  const argRows = Object.entries(redacted).filter(([key]) => key !== 'command');
 
   return (
     <div className={`toolcall status-${block.status}`} data-testid="toolcall-block">
@@ -63,14 +76,28 @@ export function ToolcallBlockView({
         onClick={() => setOpen((v) => !v)}
       >
         <span className="toolcall-dot" aria-hidden="true" />
-        <code>{block.name}</code>
+        <code className="toolcall-name">{block.name}</code>
+        {command && (
+          <>
+            {' '}
+            <code className="toolcall-command">{command}</code>
+          </>
+        )}
         <span className="muted">· {statusLabel}</span>
         <span className="muted">{open ? '▾' : '▸'}</span>
       </button>
+      {argRows.length > 0 && (
+        <div className="toolcall-args" data-testid="toolcall-args">
+          {argRows.map(([key, value]) => (
+            <div key={key} className="toolcall-arg">
+              <span className="toolcall-arg-key">{key}:</span>{' '}
+              <span className="toolcall-arg-value">{formatArgValue(value)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {open && (
         <div className="toolcall-detail">
-          <div className="muted">args (redacted)</div>
-          <pre>{JSON.stringify(redactArgs(block.args), null, 2)}</pre>
           {block.result && (
             <>
               <div className="muted">result</div>

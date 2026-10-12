@@ -23,6 +23,7 @@ export interface ReasoningBlock {
 
 export type AssistantBlock =
   | { kind: 'text'; id: string; text: string }
+  | { kind: 'final'; id: string; text: string }
   | ToolCallBlock
   | ReasoningBlock;
 

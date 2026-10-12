@@ -110,8 +110,8 @@ export function ModelPicker({
           {loading && models.length === 0 && !noProfile ? '…' : current}
         </span>
         {models.length > 0 && (
-          <span className="muted tiny" data-testid="model-count">
-            {models.length}
+          <span className="muted tiny" data-testid="model-count" title={`${models.length} models available`}>
+            {models.length} models
           </span>
         )}
       </button>

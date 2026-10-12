@@ -417,7 +417,7 @@ class LiveExecutor:
     ) -> dict[str, Any]:
         """Run one command id on the linked document (activate-first).
 
-        :param command: Engine/UI command id (e.g. ``image.imageRotationcw``,
+        :param command: Engine/UI command id (e.g. ``image.imageRotation.90cw``,
             ``document.inspect``).
         :param params: Command params object (``{}`` when none).
         :returns: The command's result payload.
@@ -441,12 +441,18 @@ class LiveExecutor:
     async def commands(self, filter: str | None = None) -> dict[str, Any]:
         """List the app's command registry with params docs + enablement.
 
+        The reply arrives in whatever envelope the channel produced (the
+        desktop wraps bare arrays as ``{"value": [...]}``, other
+        transports return ``{"commands": [...]}`` or the bare array
+        itself); it is normalized here to ``{"commands": [...]}``.
+
         :param filter: Optional substring filter (None = whole registry).
-        :returns: The ``engine.commands`` result payload.
+        :returns: ``{"commands": [...]}`` — always the normalized shape.
         :raises LiveError: App down or the call failed.
         """
         params = {"filter": filter} if filter else {}
-        return await self._invoke("engine.commands", params)
+        raw = await self._invoke("engine.commands", params)
+        return {"commands": _command_entries(raw)}
 
     async def inspect(self) -> dict[str, Any]:
         """Inspect the linked document (layer tree, history, dims).
@@ -733,6 +739,28 @@ def sanitize_filename(name: str) -> str:
     """
     stem = re.sub(r"[^\w.-]+", "_", name).strip("._") or "live"
     return stem[:40]
+
+
+def _command_entries(raw: Any) -> list[Any]:
+    """Extract the command list from an ``engine.commands`` reply.
+
+    The registry travels as a bare JSON array (``crates/engine``
+    ``command.list``); channel envelopes may wrap it (``{"value": [...]}``
+    from :meth:`LiveManager._call`, or ``{"commands": [...]}`` from a
+    stub or a future transport). Anything unrecognizable degrades to an
+    empty list rather than raising.
+
+    :param raw: Raw reply payload (any shape).
+    :returns: The command-entry list (possibly empty).
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("commands", "value", "result"):
+            found = raw.get(key)
+            if isinstance(found, list):
+                return found
+    return []
 
 
 def _confine_write_path(path: str) -> str:

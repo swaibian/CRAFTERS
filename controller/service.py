@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from gateway.backends import RootsViolation, SessionRegistry
 
 from .agent import brain_from_profile, run_agent_loop
+from .commands import CommandCatalog
 from .documents import (
     DocumentError,
     DocumentRegistry,
@@ -330,6 +331,31 @@ def resolve_team(team_id: str | None) -> dict[str, Any] | None:
         if team.get("id") == team_id:
             return team
     raise HTTPException(status_code=400, detail="unknown team")
+
+
+async def fetch_live_catalog(
+    manager: LiveManager, live_app: str, document: int | None
+) -> CommandCatalog | None:
+    """Fetch the app's command registry once per live chat run.
+
+    Builds the generic middle-layer catalog (searchable by the planner and
+    the agent loop's error hints) from one ``engine.commands`` reply. A down
+    bridge or failed call degrades to ``None`` — the run still works (the
+    honest live-error path reports the outage separately).
+
+    :param manager: Live manager holding the app's bridge config.
+    :param live_app: App id to query.
+    :param document: Linked engine document index (None = leave alone).
+    :returns: Fresh :class:`~controller.commands.CommandCatalog`, or None
+        when the fetch failed.
+    """
+    try:
+        probe = LiveExecutor(manager=manager, app=live_app, document=document)
+        reply = await probe.commands()
+    except LiveError:
+        return None
+    entries = reply.get("commands") if isinstance(reply, dict) else None
+    return CommandCatalog(entries if isinstance(entries, list) else [])
 
 
 def create_app(state: ServiceState | None = None) -> FastAPI:
@@ -1068,9 +1094,17 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                 )
         is_live = bool(open_doc and open_doc.source == "live" and open_doc.live_app)
         live_app = str(open_doc.live_app or "") if is_live and open_doc else ""
+        catalog: CommandCatalog | None = None
+        if is_live:
+            catalog = await fetch_live_catalog(
+                owned.live,
+                live_app,
+                open_doc.live_index if open_doc else None,
+            )
+        brain = MockBrain(catalog=catalog) if catalog is not None else owned._mock
         plan_fn, model_name, is_mock = brain_from_profile(
             profile,
-            owned._mock,
+            brain,
             model_override=resolved_model,
             team=team,
             live=is_live,
@@ -1125,6 +1159,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                     session_id=session_id,
                     executor=executor,
                     live_app=live_app,
+                    catalog=catalog,
                 ):
                     yield event
 
@@ -1145,7 +1180,8 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                     elif etype == "plan" and event.get("text"):
                         assistant_text += str(event["text"]) + "\n"
                         yield sse_frame(
-                            "text.delta", {"delta": str(event["text"]) + "\n"}
+                            "text.delta",
+                            {"delta": str(event["text"]) + "\n", "phase": "reasoning"},
                         )
                     elif etype == "tool.call":
                         yield sse_frame(
@@ -1180,13 +1216,15 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                         yield sse_frame(
                             "text.delta",
                             {
-                                "delta": f"[observed revision {event.get('observation', {}).get('revision')}] \n"
+                                "delta": f"[observed revision {event.get('observation', {}).get('revision')}] \n",
+                                "phase": "reasoning",
                             },
                         )
                     elif etype == "run.completed":
                         assistant_text += str(event.get("summary", ""))
                         yield sse_frame(
-                            "text.delta", {"delta": str(event.get("summary", ""))}
+                            "text.delta",
+                            {"delta": str(event.get("summary", "")), "phase": "final"},
                         )
                         yield sse_frame(
                             "response.completed",

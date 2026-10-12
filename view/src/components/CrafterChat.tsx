@@ -8,12 +8,132 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { downloadResultUrl, fetchProfileModels } from '../lib/api';
-import { nextId, type ChatMessage } from '../lib/chat';
+import { nextId, type AssistantBlock, type ChatMessage, type ReasoningBlock } from '../lib/chat';
 import { resizeImage } from '../lib/image';
 import { logger } from '../lib/logger';
 import { Markdown } from './Markdown';
 import { ModelPicker } from './ModelPicker';
 import { ToolcallBlockView } from './ToolcallView';
+
+function stepPreview(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length > 110 ? `${compact.slice(0, 107)}…` : compact;
+}
+
+/**
+ * One reasoning step. The step text must render exactly once: the compact
+ * preview is the collapsed affordance, the Markdown body is the expanded
+ * content — never both (an open step used to show its text twice).
+ */
+function ReasoningStepView({
+  step,
+  index,
+  defaultOpen,
+}: {
+  step: ReasoningBlock;
+  index: number;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <details
+      className="reasoning-step"
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+      data-testid="reasoning-step"
+    >
+      <summary>
+        <span className="step-index">Step {index + 1}</span>
+        {!open && <span className="step-preview">{stepPreview(step.text)}</span>}
+      </summary>
+      {open && <Markdown text={step.text} />}
+    </details>
+  );
+}
+
+function AssistantBlocks({
+  blocks,
+  sessionId,
+  docId,
+  verifyAvailable,
+  onVerifyCommand,
+}: {
+  blocks: AssistantBlock[];
+  sessionId: string | null;
+  docId: string | null;
+  verifyAvailable: Record<string, boolean>;
+  onVerifyCommand: (command: string) => void;
+}) {
+  const reasoning = blocks.filter((block) => block.kind === 'reasoning');
+  const toolcalls = blocks.filter((block) => block.kind === 'toolcall');
+  let reasoningRendered = false;
+  let toolcallsRendered = false;
+
+  return (
+    <>
+      {blocks.map((block) => {
+        if (block.kind === 'text') return <Markdown key={block.id} text={block.text} />;
+        if (block.kind === 'final') {
+          return (
+            <div key={block.id} className="final-response" data-testid="final-response">
+              <span className="final-response-label">Final response</span>
+              <Markdown text={block.text} />
+            </div>
+          );
+        }
+
+        if (block.kind === 'reasoning') {
+          if (reasoningRendered) return null;
+          reasoningRendered = true;
+          return (
+            <details key="reasoning-group" className="activity-group reasoning-group" open>
+              <summary>
+                <span>Reasoning</span>
+                <span className="activity-count">{reasoning.length}</span>
+              </summary>
+              <div className="activity-list">
+                {reasoning.map((step, index) => {
+                  const recent = index >= reasoning.length - 2;
+                  return (
+                    <ReasoningStepView
+                      key={`${step.id}-${recent ? 'recent' : 'older'}`}
+                      step={step}
+                      index={index}
+                      defaultOpen={recent}
+                    />
+                  );
+                })}
+              </div>
+            </details>
+          );
+        }
+
+        if (toolcallsRendered) return null;
+        toolcallsRendered = true;
+        return (
+          <details key="toolcall-group" className="activity-group toolcall-group">
+            <summary>
+              <span>Tool calls</span>
+              <span className="activity-count">{toolcalls.length}</span>
+            </summary>
+            <div className="activity-list">
+              {toolcalls.map((tool) => (
+                <ToolcallBlockView
+                  key={tool.id}
+                  block={tool}
+                  sessionId={sessionId}
+                  docId={docId}
+                  verifyAvailable={verifyAvailable}
+                  onVerifyCommand={onVerifyCommand}
+                />
+              ))}
+            </div>
+          </details>
+        );
+      })}
+    </>
+  );
+}
 
 export function CrafterChat({
   messages,
@@ -167,26 +287,13 @@ export function CrafterChat({
               </>
             ) : (
               <div className="msg-body">
-                {(m.blocks ?? []).map((b) => {
-                  if (b.kind === 'text') return <Markdown key={b.id} text={b.text} />;
-                  if (b.kind === 'reasoning')
-                    return (
-                      <details key={b.id} className="reasoning">
-                        <summary>reasoning</summary>
-                        <Markdown text={b.text} />
-                      </details>
-                    );
-                  return (
-                    <ToolcallBlockView
-                      key={b.id}
-                      block={b}
-                      sessionId={sessionId}
-                      docId={docId}
-                      verifyAvailable={verifyAvailable}
-                      onVerifyCommand={onVerifyCommand}
-                    />
-                  );
-                })}
+                <AssistantBlocks
+                  blocks={m.blocks ?? []}
+                  sessionId={sessionId}
+                  docId={docId}
+                  verifyAvailable={verifyAvailable}
+                  onVerifyCommand={onVerifyCommand}
+                />
                 {m.text && <Markdown text={m.text} />}
                 {m.pending && (
                   <span className="working-pill" role="status">

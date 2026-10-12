@@ -18,7 +18,7 @@
 | `view/src/hooks/useChatStream.ts` (144) | SSE subscription via `fetch`+reader: incremental `text.delta` assembly, `tool.call`/`tool.result` block events, error/retry, Esc-cancel, reduced-motion-aware | stories #2–3 stream |
 | `view/src/hooks/useChatStream.test.tsx` | Mocked-SSE tests: chunks assemble, toolcall events land, errors surface, retry works | SWE4 |
 | `controller/llm.py` (468) | `LlmClient` (OpenAI-compatible chat-completions + tools against the configured profile) + `MockBrain` (deterministic no-key planner: resize/rotate/grayscale/blur, set-cell/add-sheet, page ops; value-trimming + numeric coercion) + `ping()` endpoint probe | agent brain |
-| `controller/agent.py` (468) | **The agent loop**: plan → execute (doc adapters + gateway-mapped tools) → observe (re-read = see) → reason → up to 8 iterations; snapshot-guard destructive ops; claim ledger per run; async event generator (`run.started/plan/tool.call/tool.result/response.completed`) | do/see/reason/retry |
+| `controller/agent.py` (468) | **The agent loop**: plan → execute (doc adapters + gateway-mapped tools) → observe (re-read = see) → reason → up to 32 iterations (current default); snapshot-guard destructive ops; claim ledger per run; async event generator (`run.started/plan/tool.call/tool.result/response.completed`) | do/see/reason/retry |
 | `controller/documents.py` (726) | Real local adapters on user files (copies in session work dir, never originals): sheet (.xlsx via openpyxl: inspect/set_cell/add_sheet + re-read verify), photo (PIL: inspect/stats + resize/rotate/grayscale/blur + rehash verify), pdf (pypdf/pymupdf: inspect/text/rotate/delete + thumbnail + re-read verify); per-doc revisions + snapshots | north-star docs |
 
 ### Changed Files

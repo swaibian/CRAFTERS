@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 
+from .commands import CommandCatalog, keywords, params_from_message
 from .logger import get_logger, safe_event
 
 log = get_logger()
@@ -183,20 +184,21 @@ LIVE_APP_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "command_run",
             "description": (
-                "Run one command of the open app's own command surface on the "
-                "user's OPEN document — the effect is visible immediately in "
-                "the app window. E.g. image.imageRotationcw rotates 90 degrees "
-                "clockwise, image.imageRotationccw counter-clockwise, "
-                "image.imageRotation 180 degrees, image.mode.grayscale converts "
-                "to grayscale, filter.blur.gaussianBlur blurs. Discover command "
-                "ids and their params with command_list first."
+                "Run ANY registry command id on the user's open document "
+                "through the app's command surface — the effect is visible "
+                "immediately in the app window (id format: "
+                "image.imageRotation.90cw). Never invent ids — discover with "
+                "command_list first. Args: command (bare id string), params "
+                "(object or omit)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Command id, e.g. image.imageRotationcw.",
+                        "description": (
+                            "Bare command id string exactly as listed by command_list."
+                        ),
                     },
                     "params": {
                         "type": "object",
@@ -215,18 +217,26 @@ LIVE_APP_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "command_list",
             "description": (
-                "List the open app's full command registry (ids, labels, "
-                "parameter docs, enablement) to discover its functionality. "
-                "An optional filter narrows by substring."
+                "Search the app's command registry — every function the app "
+                "exposes (layers, blend modes, filters, adjustments, text, "
+                "selection...). ALWAYS pass a short keyword filter (e.g. "
+                "'blend', 'duplicate', 'desaturate', 'rotate') — the full "
+                "registry is huge and unfiltered listings are not useful. "
+                "Returns id (label) entries; use the id in command_run."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filter": {
                         "type": "string",
-                        "description": "Optional substring filter on command ids.",
+                        "description": (
+                            "Keyword filter: matched against command ids, "
+                            "labels, menus and params docs (e.g. 'rotate' "
+                            "finds image.imageRotation.*)."
+                        ),
                     }
                 },
+                "required": ["filter"],
             },
         },
     },
@@ -515,21 +525,19 @@ class MockBrain:
     - Anything else → a clarifying question (no tool calls).
 
     Live mode (``live=True``) plans against the app's command surface
-    instead of the adapters:
+    generically via the attached :class:`~controller.commands.CommandCatalog`
+    — there is NO phrase→command-id table. Salient keywords are searched in
+    the registry and the best-scoring entry becomes ``command_run`` (params
+    inferred from the entry's own params doc); without a catalog match the
+    plan is ``command_list`` discovery for the top keyword; a save request
+    still routes to ``doc_save``; nothing salient → ``done``.
 
-    - ``rotate ... clockwise`` / ``rotate 90`` → ``command_run
-      image.imageRotationcw``.
-    - ``rotate ... counter...`` → ``command_run image.imageRotationccw``.
-    - ``rotate 180`` → ``command_run image.imageRotation``.
-    - ``grayscale`` / ``black and white`` → ``command_run
-      image.mode.grayscale``.
-    - ``blur`` → ``command_run filter.blur.gaussianBlur {radius: 3}``.
-    - ``save`` → ``doc_save``.
-    - Anything else → ``done`` with a summary.
+    :param catalog: Command registry to search (None = discovery fallback).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, catalog: CommandCatalog | None = None) -> None:
         self._counter = 0
+        self.catalog = catalog
 
     def _call(self, name: str, arguments: dict[str, Any]) -> ToolCall:
         self._counter += 1
@@ -573,7 +581,7 @@ class MockBrain:
             return LlmPlan(text="", tool_calls=calls, mock=True, model="mock")
 
         if live:
-            return self._plan_live(text, lowered, team_id)
+            return self._plan_live(text, team_id)
 
         width: int | None = None
         height: int | None = None
@@ -693,59 +701,55 @@ class MockBrain:
         )
         return plan
 
-    def _plan_live(
-        self, text: str, lowered: str, team_id: str | None = None
-    ) -> LlmPlan:
-        """Plan one live-app command for a user message (deterministic).
+    def _plan_live(self, text: str, team_id: str | None = None) -> LlmPlan:
+        """Plan live-app work generically from the command catalog.
 
-        Maps edit phrasing onto the open app's command surface (never the
-        document adapters — the live lane must not touch the imported copy).
+        Deterministic and table-free: salient keywords (stopwords dropped)
+        are searched in the attached :class:`~controller.commands.CommandCatalog`
+        and the best-scoring registry entry becomes ``command_run`` — params
+        come from the entry's own params doc via
+        :func:`~controller.commands.params_from_message`. A save request
+        routes to ``doc_save``; with no catalog (or no match) a
+        ``command_list`` discovery call for the top keyword; nothing salient
+        at all → ``done``.
 
         :param text: Stripped user message.
-        :param lowered: Lowercased message for pattern matching.
         :param team_id: Owning team id (prefixes the reply when set).
         :returns: :class:`LlmPlan` with ``mock=True`` and one tool call.
         """
         calls: list[ToolCall] = []
-        if "rotat" in lowered:
-            if "counter" in lowered or "anti" in lowered:
-                calls.append(
-                    self._call("command_run", {"command": "image.imageRotationccw"})
-                )
-                reply = "Rotating the open document counterclockwise."
-            elif "180" in lowered:
-                calls.append(
-                    self._call("command_run", {"command": "image.imageRotation"})
-                )
-                reply = "Rotating the open document 180 degrees."
-            else:
-                calls.append(
-                    self._call("command_run", {"command": "image.imageRotationcw"})
-                )
-                reply = "Rotating the open document clockwise."
-        elif "grayscale" in lowered or "black and white" in lowered:
-            calls.append(self._call("command_run", {"command": "image.mode.grayscale"}))
-            reply = "Converting the open document to grayscale."
-        elif "blur" in lowered:
-            calls.append(
-                self._call(
-                    "command_run",
-                    {
-                        "command": "filter.blur.gaussianBlur",
-                        "params": {"radius": 3},
-                    },
-                )
-            )
-            reply = "Blurring the open document."
-        elif "save" in lowered:
-            calls.append(self._call("doc_save", {}))
-            reply = "Saving the open document."
-        else:
+        tokens = keywords(text)
+        reply = ""
+        if not tokens:
             summary = (
                 "No live edit matched; tell me what to change in the open app document."
             )
             calls.append(self._call("done", {"summary": summary}))
             reply = summary
+        elif tokens[0].startswith("sav"):
+            calls.append(self._call("doc_save", {}))
+            reply = "Saving the open document."
+        else:
+            matches = self.catalog.search(text) if self.catalog is not None else []
+            if matches:
+                best = matches[0]
+                arguments: dict[str, Any] = {"command": best["id"]}
+                schema = (
+                    self.catalog.params_doc(best["id"])
+                    if self.catalog is not None
+                    else best.get("params", "")
+                )
+                params = params_from_message(schema, text)
+                if params:
+                    arguments["params"] = params
+                calls.append(self._call("command_run", arguments))
+                reply = f"Running {best['id']} on the open document."
+            elif any(token.startswith("sav") for token in tokens):
+                calls.append(self._call("doc_save", {}))
+                reply = "Saving the open document."
+            else:
+                calls.append(self._call("command_list", {"filter": tokens[0]}))
+                reply = f"Listing app commands for '{tokens[0]}'."
         if team_id:
             reply = f"[team {team_id}] {reply}"
         plan = LlmPlan(text=reply, tool_calls=calls, mock=True, model="mock")

@@ -544,6 +544,9 @@ def test_chat_stream_sse_shape(client):
     names = [name for name, _ in events]
     assert names[0] == "response.started"
     assert "text.delta" in names
+    text_phases = [data.get("phase") for name, data in events if name == "text.delta"]
+    assert "reasoning" in text_phases
+    assert text_phases[-1] == "final"
     assert "tool.call" in names
     assert "tool.result" in names
     assert names[-1] == "response.completed"

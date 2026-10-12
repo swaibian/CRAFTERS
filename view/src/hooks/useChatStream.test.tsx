@@ -63,6 +63,45 @@ describe('useChatStream', () => {
     expect(asst!.pending).toBe(false);
   });
 
+  it('keeps intermediate reasoning separate from the final response', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          sseData({ event: 'text.delta', delta: 'Planning change.\n', phase: 'reasoning' }),
+          sseData({ event: 'tool.call', name: 'photo_transform', args: {} }),
+          sseData({ event: 'tool.result', name: 'photo_transform', ok: true, summary: 'done' }),
+          sseData({ event: 'text.delta', delta: '[observed revision 1]', phase: 'reasoning' }),
+          sseData({ event: 'text.delta', delta: 'Rotated the image.', phase: 'final' }),
+          sseData({ event: 'response.completed', message_id: 'm2' }),
+        ]),
+      ),
+    );
+    const messages: ChatMessage[] = [];
+    const { result } = renderHook(() =>
+      useChatStream(
+        (message) => messages.push(message),
+        (id, patch) => {
+          const index = messages.findIndex((message) => message.id === id);
+          if (index >= 0) messages[index] = patch(messages[index]!);
+        },
+      ),
+    );
+    await act(async () => {
+      result.current.send({ session_id: 's1', message: 'rotate' }, 'rotate');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const assistant = messages.find((message) => message.role === 'assistant');
+    expect(assistant?.blocks?.filter((block) => block.kind === 'reasoning').map((block) => block.text)).toEqual([
+      'Planning change.\n',
+      '[observed revision 1]',
+    ]);
+    expect(assistant?.blocks?.find((block) => block.kind === 'final')).toMatchObject({
+      text: 'Rotated the image.',
+    });
+  });
+
   it('exposes the answering model from response.started', async () => {
     vi.stubGlobal(
       'fetch',

@@ -65,7 +65,7 @@ export function useChatStream(
       setError(null);
       setModel(null);
 
-      const textBlockId = nextId('txt');
+      let textBlockId: string | null = null;
       let toolSeq = 0;
 
       const stop = streamChat(req, {
@@ -79,13 +79,22 @@ export function useChatStream(
               patchMessage(assistantId, (m) => {
                 const blocks: AssistantBlock[] = m.blocks ?? [];
                 const last = blocks[blocks.length - 1];
-                if (last && last.kind === 'text' && last.id === textBlockId) {
+                const kind = event.phase === 'reasoning' ? 'reasoning' : event.phase === 'final' ? 'final' : 'text';
+                if (last && last.kind === kind && last.id === textBlockId) {
                   return {
                     ...m,
                     blocks: [...blocks.slice(0, -1), { ...last, text: last.text + event.delta }],
                   };
                 }
-                return { ...m, blocks: [...blocks, { kind: 'text', id: textBlockId, text: event.delta }] };
+                const id = nextId('txt');
+                textBlockId = id;
+                const nextBlock: AssistantBlock =
+                  kind === 'reasoning'
+                    ? { kind: 'reasoning', id, text: event.delta }
+                    : kind === 'final'
+                      ? { kind: 'final', id, text: event.delta }
+                      : { kind: 'text', id, text: event.delta };
+                return { ...m, blocks: [...blocks, nextBlock] };
               });
               break;
             case 'tool.call':

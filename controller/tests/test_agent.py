@@ -1,24 +1,37 @@
 """SWE4 tests: agent loop with MockBrain + LlmClient parsing.
 
 Positive: edit request → ops executed → observed → record ledger non-empty;
-run.completed summary; done-call path. Live lane: MockBrain live patterns
-map onto the app command surface and brain_from_profile(live=True)
-advertises LIVE_APP_TOOLS with the live system prompt.
+run.completed summary; done-call path. Live lane: MockBrain plans generically
+from the CommandCatalog (no phrase→id table), command_run arg unwrapping
+accepts double-wrapped envelopes, unknown-command errors gain nearest-id
+suggestions, and brain_from_profile(live=True) advertises LIVE_APP_TOOLS
+with the live system prompt.
 Negative: empty message, no document open, unknown tool, oversized budget
 stop; measured-without-evidence rejected; LlmError paths (auth/transport).
 """
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from controller.agent import (
+    MAX_ITERATIONS,
     AgentRun,
+    _evidence_hint,
+    _execute_live_call,
     brain_from_profile,
     run_agent_loop,
 )
-from controller.documents import DocumentRegistry, PhotoAdapter, SheetAdapter
-from controller.llm import LlmClient, LlmError, MockBrain
+from controller.documents import (
+    DocumentError,
+    DocumentRegistry,
+    PhotoAdapter,
+    SheetAdapter,
+)
+from controller.llm import LlmClient, LlmError, LlmPlan, MockBrain, ToolCall
+from controller.tests.test_commands import make_catalog
 
 
 @pytest.fixture()
@@ -91,38 +104,66 @@ def test_mockbrain_team_prefix():
     [
         (
             "rotate the picture clockwise",
-            {"command": "image.imageRotationcw"},
+            {"command": "image.imageRotation.90cw"},
         ),
-        ("rotate 90 clockwise", {"command": "image.imageRotationcw"}),
-        ("rotate the canvas counter", {"command": "image.imageRotationccw"}),
-        ("rotate counterclockwise", {"command": "image.imageRotationccw"}),
-        ("rotate 180", {"command": "image.imageRotation"}),
-        ("make it grayscale", {"command": "image.mode.grayscale"}),
-        ("convert to black and white", {"command": "image.mode.grayscale"}),
+        ("rotate 90 clockwise", {"command": "image.imageRotation.90cw"}),
         (
-            "blur the image",
-            {"command": "filter.blur.gaussianBlur", "params": {"radius": 3}},
+            "make it black and white",
+            {"command": "image.adjustments.blackWhite"},
+        ),
+        (
+            "can you please make the picture black & white ?",
+            {"command": "image.adjustments.blackWhite"},
+        ),
+        (
+            "duplicate the layer",
+            {"command": "layer.duplicate"},
         ),
     ],
 )
-def test_mockbrain_live_command_run_patterns(message, arguments):
-    """Live mode maps edit phrasing onto the app's command surface."""
-    brain = MockBrain()
+def test_mockbrain_live_plans_from_catalog(message, arguments):
+    """Live mode discovers ids from the catalog — no phrase→id table."""
+    brain = MockBrain(catalog=make_catalog())
     plan = brain.plan(message, live=True)
     assert plan.mock is True and plan.model == "mock"
     assert plan.tool_calls and plan.tool_calls[0].name == "command_run"
     assert plan.tool_calls[0].arguments == arguments
 
 
-def test_mockbrain_live_save_and_done():
+def test_mockbrain_live_blend_mode_params_from_schema():
+    """Blend modes are PARAM VALUES of one layer command, inferred from schema."""
+    brain = MockBrain(catalog=make_catalog())
+    plan = brain.plan("set the layer blend mode to multiply", live=True)
+    call = plan.tool_calls[0]
+    assert call.name == "command_run"
+    assert call.arguments["command"] in {
+        "layer.setProps",
+        "layer.layerStyle.blendingOptions",
+    }
+    assert "Multiply" in call.arguments.get("params", {}).values()
+
+
+def test_mockbrain_live_no_catalog_plans_command_list():
+    """No catalog (or no match) → discovery call for the top keyword."""
     brain = MockBrain()
+    plan = brain.plan("make it black and white", live=True)
+    assert plan.tool_calls[0].name == "command_list"
+    assert plan.tool_calls[0].arguments == {"filter": "black"}
+    blind = MockBrain(catalog=make_catalog())
+    unmatchable = blind.plan("frobnicate the widget", live=True)
+    assert unmatchable.tool_calls[0].name == "command_list"
+    assert unmatchable.tool_calls[0].arguments == {"filter": "frobnicate"}
+
+
+def test_mockbrain_live_save_and_done():
+    brain = MockBrain(catalog=make_catalog())
     save_plan = brain.plan("please save the document", live=True)
     assert save_plan.tool_calls[0].name == "doc_save"
-    other = brain.plan("tell me a story", live=True)
+    other = brain.plan("do it", live=True)
     assert other.tool_calls[0].name == "done"
     assert other.tool_calls[0].arguments["summary"]
     followup = brain.plan(
-        "Done so far: Ran image.imageRotationcw in the open app. "
+        "Done so far: Ran image.imageRotation.90cw in the open app. "
         "Original request: rotate the picture clockwise.",
         live=True,
     )
@@ -134,6 +175,417 @@ def test_mockbrain_adapter_mode_unchanged_for_live_phrasing():
     brain = MockBrain()
     plan = brain.plan("rotate the picture clockwise", doc_kind="photo")
     assert plan.tool_calls[0].name == "photo.transform"
+
+
+# --- command_run arg normalization -------------------------------------------
+
+
+class _RecordingExecutor:
+    """Minimal live-executor stand-in recording command_run round trips."""
+
+    app = "photocraft"
+
+    def __init__(self, error=None):
+        self.calls = []
+        self._error = error
+
+    async def execute(self, command, params=None):
+        if self._error is not None:
+            raise self._error
+        self.calls.append((command, params))
+        return {}
+
+    async def commands(self, filter=None):
+        return {"commands": []}
+
+    async def inspect(self):
+        return {}
+
+    async def look(self):
+        return b"fake-png-bytes"
+
+    async def save(self, path=None):
+        return {"path": path or "own.psd"}
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"command": "x"}, ("x", {})),
+        ({"id": "x"}, ("x", {})),
+        ({"command": "x", "params": {"a": 1}}, ("x", {"a": 1})),
+        ({"id": "x", "params": {"a": 1}}, ("x", {"a": 1})),
+        ({"command": {"command": "x", "params": {"a": 1}}}, ("x", {"a": 1})),
+        ({"command": {"id": "x"}}, ("x", {})),
+        ({"id": {"command": "x", "params": {"a": 1}}}, ("x", {"a": 1})),
+        ({"command": '{"command": "x"}'}, ("x", {})),
+        ({"command": '{"id": "x", "params": {"a": 1}}'}, ("x", {"a": 1})),
+        ({"id": '{"command": "x"}'}, ("x", {})),
+        ({"command": {"command": {"id": "x"}}}, ("x", {})),
+        (
+            {"command": {"command": "x", "params": {"a": 1}}, "params": {"b": 2}},
+            ("x", {"a": 1}),
+        ),
+    ],
+)
+async def test_command_run_arg_unwrap_matrix(arguments, expected):
+    """command_run accepts command/id keys and unwraps nested/JSON envelopes."""
+    executor = _RecordingExecutor()
+    await _execute_live_call(
+        ToolCall(name="command_run", arguments=dict(arguments), call_id="mock_1"),
+        executor,
+    )
+    assert executor.calls == [expected]
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"command": "not an id!"},
+        {"command": {"foo": 1}},
+        {"command": 5},
+        {"command": '{"command": '},
+        {"id": "x y"},
+    ],
+)
+async def test_command_run_arg_unwrap_garbage_clear_error(arguments):
+    """Garbage ids fail with one clear hint, never an app-side wall."""
+    executor = _RecordingExecutor()
+    with pytest.raises(DocumentError) as excinfo:
+        await _execute_live_call(
+            ToolCall(name="command_run", arguments=dict(arguments), call_id="mock_1"),
+            executor,
+        )
+    message = str(excinfo.value)
+    assert "bare command id" in message
+    assert "image.imageRotation.90cw" in message
+    assert "command_list" in message
+
+
+# --- command_list client-side filtering --------------------------------------
+
+
+class _ListAllExecutor(_RecordingExecutor):
+    """Executor whose engine.commands IGNORES the filter (like the desktop)."""
+
+    REGISTRY: ClassVar[list] = [
+        {"id": "app.new", "label": "New"},
+        {"id": "image.imageRotation.90cw", "label": "90° Clockwise"},
+        {"id": "image.imageRotation.90ccw", "label": "90° Counter Clockwise"},
+        {"id": "image.adjustments.desaturate", "label": "Desaturate"},
+        {"id": "image.adjustments.blackWhite", "label": "Black & White"},
+        {"id": "layer.duplicate", "label": "Duplicate Layer"},
+    ]
+
+    async def commands(self, filter=None):
+        return {"commands": list(self.REGISTRY)}  # never filters server-side
+
+
+@pytest.mark.asyncio()
+async def test_command_list_filters_client_side_desktop_ignores_filter():
+    """Desktop engine.commands returns the WHOLE registry even with a
+    filter (it ignores the param) — the tool layer must filter, or the
+    planner re-lists 818 entries forever (tonight's transcript bug)."""
+    executor = _ListAllExecutor()
+    evidence = await _execute_live_call(
+        ToolCall(name="command_list", arguments={"filter": "rotate"}, call_id="mock_1"),
+        executor,
+    )
+    ids = [e["id"] for e in evidence["entries"]]
+    assert "image.imageRotation.90cw" in ids
+    assert "image.imageRotation.90ccw" in ids
+    assert "layer.duplicate" not in ids
+    assert evidence["count"] == len(ids)  # matched, not 6
+    assert evidence["total"] == 6  # registry size still reported
+    assert evidence["filter"] == "rotate"
+
+
+@pytest.mark.asyncio()
+async def test_command_list_without_filter_returns_whole_registry():
+    executor = _ListAllExecutor()
+    evidence = await _execute_live_call(
+        ToolCall(name="command_list", arguments={}, call_id="mock_1"),
+        executor,
+    )
+    assert evidence["count"] == evidence["total"] == 6
+    assert evidence["filter"] == ""
+
+
+@pytest.mark.asyncio()
+async def test_command_list_carries_params_schema_for_the_planner():
+    """The planner must learn HOW to call an id (curves takes
+    {"points": [[in,out],…]}) — without the schema it cannot form a
+    highlight-reducing curve from 'the faces are too bright'."""
+    executor = _ListAllExecutor()
+    executor.REGISTRY = [  # type: ignore[misc]
+        {
+            "id": "image.adjustments.curves",
+            "label": "Curves…",
+            "params": '{"points":json} (curves as [[in,out],…] in 0..255, 2..19 points)',
+        }
+    ]
+    evidence = await _execute_live_call(
+        ToolCall(name="command_list", arguments={"filter": "curves"}, call_id="mock_1"),
+        executor,
+    )
+    entry = evidence["entries"][0]
+    assert entry["id"] == "image.adjustments.curves"
+    assert "points" in entry["params"]
+    hint = _evidence_hint(evidence)
+    assert "points" in hint
+    assert "command_run" in hint
+
+
+@pytest.mark.asyncio()
+async def test_command_list_empty_match_is_honest():
+    executor = _ListAllExecutor()
+    evidence = await _execute_live_call(
+        ToolCall(
+            name="command_list", arguments={"filter": "frobnicate"}, call_id="mock_1"
+        ),
+        executor,
+    )
+    assert evidence["entries"] == []
+    assert evidence["count"] == 0
+    hint = _evidence_hint(evidence)
+    assert "No commands match filter 'frobnicate'" in hint
+
+
+# --- unknown-command suggestions ---------------------------------------------
+
+
+@pytest.mark.asyncio()
+async def test_unknown_command_error_suggests_nearest_ids(tmp_path):
+    from controller.live import LiveError
+
+    def _plan(message, kind):
+        return LlmPlan(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    name="command_run",
+                    arguments={"command": "image.adjustments.desatur"},
+                    call_id="mock_1",
+                )
+            ],
+            mock=True,
+            model="mock",
+        )
+
+    executor = _RecordingExecutor(
+        error=LiveError(
+            "engine.execute failed: unknown command `image.adjustments.desatur`"
+        )
+    )
+    events = [
+        event
+        async for event in run_agent_loop(
+            "make it desaturated",
+            doc_id=None,
+            registry=DocumentRegistry(tmp_path / "work"),
+            plan_fn=_plan,
+            executor=executor,
+            live_app="photocraft",
+            catalog=make_catalog(),
+        )
+    ]
+    results = [e for e in events if e["type"] == "tool.result"]
+    assert results[0]["ok"] is False
+    error = results[0]["error"]
+    assert "did you mean: " in error
+    assert "image.adjustments.desaturate" in error
+    assert "command_list to discover ids" in error
+
+
+# --- verification loop (observe → reason → stop) ------------------------------
+
+
+class _StatefulExecutor(_RecordingExecutor):
+    """Executor whose inspect() reflects how many edits landed."""
+
+    def __init__(self):
+        super().__init__()
+        self.history = ["open"]
+        self.rotated = 0
+
+    async def execute(self, command, params=None):
+        self.calls.append((command, params))
+        if command != "document.inspect":
+            self.history.append(command)
+            if "Rotation" in command:
+                self.rotated += 1
+        return {}
+
+    async def inspect(self):
+        width, height = 48, 32
+        if self.rotated % 2 == 1:
+            width, height = 32, 48
+        return {
+            "width": width,
+            "height": height,
+            "layers": [{"name": "Background", "kind": "raster", "opacity": 100}],
+            "history": [{"name": h} for h in self.history],
+        }
+
+
+def _fixed_plan(*calls):
+    """plan_fn returning the given calls as one batch, then done."""
+
+    batch = list(calls)
+
+    def _plan(message, kind):
+        if message.startswith("Done so far:"):
+            return LlmPlan(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        name="done",
+                        arguments={"summary": "Done."},
+                        call_id="mock_done",
+                    )
+                ],
+                mock=True,
+                model="mock",
+            )
+        if batch:
+            taken = list(batch)
+            batch.clear()
+            return LlmPlan(text="on it", tool_calls=taken, mock=True, model="mock")
+        return LlmPlan(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    name="done",
+                    arguments={"summary": "Done."},
+                    call_id="mock_done",
+                )
+            ],
+            mock=True,
+            model="mock",
+        )
+
+    return _plan
+
+
+@pytest.mark.asyncio()
+async def test_repeated_mutation_across_look_is_refused(tmp_path):
+    """rotate → look → rotate: the second rotate must NOT run (was the
+    triple-rotate bug — the guard only caught consecutive repeats)."""
+    from controller.live import LiveError  # noqa: F401  (import sanity)
+
+    executor = _StatefulExecutor()
+    rotate = ToolCall(
+        name="command_run",
+        arguments={"command": "image.imageRotation.90cw"},
+        call_id="mock_r1",
+    )
+    look = ToolCall(name="look", arguments={}, call_id="mock_l1")
+    events = [
+        event
+        async for event in run_agent_loop(
+            "rotate the picture clockwise",
+            doc_id=None,
+            registry=DocumentRegistry(tmp_path / "work"),
+            plan_fn=_fixed_plan(rotate, look, rotate),
+            executor=executor,
+            live_app="photocraft",
+        )
+    ]
+    rotates = [c for c in executor.calls if c[0] != "document.inspect"]
+    assert rotates == [("image.imageRotation.90cw", {})], rotates
+    results = [e for e in events if e["type"] == "tool.result"]
+    assert results[0]["ok"] is True
+    assert results[-1]["ok"] is False
+    assert "already applied earlier in this run" in results[-1]["error"]
+    assert "apply the change twice" in results[-1]["error"]
+    assert "earlier application stands" in events[-1]["summary"]
+
+
+@pytest.mark.asyncio()
+async def test_followup_prompt_carries_state_and_change_verdict(tmp_path):
+    """The planner must SEE that the edit landed — the blind 'I'll verify'
+    loop re-ran edits because nothing reported the new state."""
+    seen_messages: list[str] = []
+    executor = _StatefulExecutor()
+
+    def _plan(message, kind):
+        seen_messages.append(message)
+        if message.startswith("Done so far:"):
+            return LlmPlan(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        name="done", arguments={"summary": "Done."}, call_id="mock_done"
+                    )
+                ],
+                mock=True,
+                model="mock",
+            )
+        return LlmPlan(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    name="command_run",
+                    arguments={"command": "image.imageRotation.90cw"},
+                    call_id="mock_r",
+                )
+            ],
+            mock=True,
+            model="mock",
+        )
+
+    events = [
+        event
+        async for event in run_agent_loop(
+            "rotate the picture clockwise",
+            doc_id=None,
+            registry=DocumentRegistry(tmp_path / "work"),
+            plan_fn=_plan,
+            executor=executor,
+            live_app="photocraft",
+        )
+    ]
+    followup = seen_messages[-1]
+    assert followup.startswith("Done so far:")
+    assert "Ran image.imageRotation.90cw" in followup
+    assert "Current document state:" in followup
+    assert "32x48 px" in followup  # dims swapped = the rotation landed
+    assert "history 2" in followup
+    assert "satisfies the request" in followup
+    assert events[-1]["type"] == "run.completed"
+
+
+@pytest.mark.asyncio()
+async def test_observe_reports_change_between_steps(tmp_path):
+    """observe events carry the changed verdict (True after an edit)."""
+    executor = _StatefulExecutor()
+    events = [
+        event
+        async for event in run_agent_loop(
+            "rotate the picture clockwise",
+            doc_id=None,
+            registry=DocumentRegistry(tmp_path / "work"),
+            plan_fn=_fixed_plan(
+                ToolCall(
+                    name="command_run",
+                    arguments={"command": "image.imageRotation.90cw"},
+                    call_id="mock_r",
+                ),
+                ToolCall(name="doc_inspect", arguments={}, call_id="mock_i"),
+            ),
+            executor=executor,
+            live_app="photocraft",
+        )
+    ]
+    observes = [e for e in events if e["type"] == "observe"]
+    # Baseline before the first edit → the first observe can PROVE the
+    # rotation landed (dims swapped), the read-only inspect after it
+    # correctly reports "unchanged".
+    assert observes[0]["changed"] is True
+    assert observes[1]["changed"] is False
 
 
 def test_brain_from_profile_live_uses_live_tools(monkeypatch):
@@ -179,12 +631,14 @@ def test_brain_from_profile_live_uses_live_tools(monkeypatch):
     assert seen["tools"] is AGENT_TOOLS
     assert "open document copy" in seen["system"]
 
-    # The no-key path plans live commands too.
-    mock_fn, mock_model, mock_flag = brain_from_profile(None, live=True)
+    # The no-key path plans live commands generically from the catalog.
+    mock_fn, mock_model, mock_flag = brain_from_profile(
+        None, MockBrain(catalog=make_catalog()), live=True
+    )
     assert mock_flag is True and mock_model == "mock"
     plan = mock_fn("rotate the picture clockwise", "photo")
     assert plan.tool_calls[0].name == "command_run"
-    assert plan.tool_calls[0].arguments == {"command": "image.imageRotationcw"}
+    assert plan.tool_calls[0].arguments == {"command": "image.imageRotation.90cw"}
 
 
 def test_brain_from_profile_team_and_model_override(monkeypatch):
@@ -358,6 +812,11 @@ def test_ledger_rejects_measured_without_evidence():
         run.record("  ", "inferred", [])
     entry = run.record("done", "inferred", [])
     assert entry.record_id.startswith("rec_")
+
+
+def test_agent_iteration_budget_defaults_to_32():
+    assert MAX_ITERATIONS == 32
+    assert AgentRun(run_id="run_x", session_id="s").max_iterations == 32
 
 
 # --- LlmClient parsing ----------------------------------------------------------

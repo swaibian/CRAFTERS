@@ -75,7 +75,22 @@ SESSION_INSPECT = {
 DOC_INSPECT = {
     "width": 48,
     "height": 32,
-    "layers": [{"id": 0}, {"id": 1}],
+    "layers": [
+        {
+            "id": 0,
+            "name": "Background",
+            "kind": "raster",
+            "blend": "Normal",
+            "opacity": 100,
+        },
+        {
+            "id": 1,
+            "name": "copy",
+            "kind": "raster",
+            "blend": "Screen",
+            "opacity": 80,
+        },
+    ],
     "history": [{"name": "open"}, {"name": "rotate"}, {"name": "blur"}],
 }
 
@@ -101,6 +116,7 @@ class LiveStubServer:
         self._require_token = require_token
         self._screenshot_b64 = screenshot_b64
         self._command_errors = dict(command_errors or {})
+        self._mutations: list = []
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -190,7 +206,14 @@ class LiveStubServer:
                 }
             self.execute_calls.append((command, params.get("params") or {}))
             if command == "document.inspect":
-                return {"id": msg.get("id"), "ok": True, "result": DOC_INSPECT}
+                # Honest engine model: history grows with every applied
+                # command, so before/after diffs can prove an edit landed.
+                info = dict(DOC_INSPECT)
+                info["history"] = DOC_INSPECT["history"] + [
+                    {"name": name} for name in self._mutations
+                ]
+                return {"id": msg.get("id"), "ok": True, "result": info}
+            self._mutations.append(command)
             return {
                 "id": msg.get("id"),
                 "ok": True,
@@ -203,12 +226,12 @@ class LiveStubServer:
             result = {"image": self._screenshot_b64} if self._screenshot_b64 else {}
         elif method == "engine.commands":
             self.command_list_calls.append(params.get("filter"))
-            result = {
-                "commands": [
-                    {"id": "image.imageRotationcw"},
-                    {"id": "image.mode.grayscale"},
-                ]
-            }
+            # Real shape: `engine.commands` answers a bare JSON array
+            # (crates/engine `command.list`), never an envelope object.
+            result = [
+                {"id": "image.imageRotation.90cw"},
+                {"id": "image.adjustments.desaturate"},
+            ]
         elif method == "app.save":
             self.save_calls.append(params.get("path"))
             result = {"path": params.get("path") or "second.psd", "warnings": []}
@@ -752,15 +775,15 @@ def test_executor_execute_activates_then_runs():
                 bridges={"photocraft": _bridge("photocraft", stub.port)}
             )
             executor = LiveExecutor(manager=manager, app="photocraft", document=1)
-            result = await executor.execute("image.imageRotationcw", {"angle": 90})
+            result = await executor.execute("image.imageRotation.90cw", {"angle": 90})
             assert result["width"] == 48
             assert stub.activate_calls == [1]
-            assert stub.execute_calls == [("image.imageRotationcw", {"angle": 90})]
+            assert stub.execute_calls == [("image.imageRotation.90cw", {"angle": 90})]
             # No linked index → no document.activate step.
             plain = LiveExecutor(manager=manager, app="photocraft")
-            await plain.execute("image.imageRotation")
+            await plain.execute("image.imageRotation.180")
             assert stub.activate_calls == [1]
-            assert stub.execute_calls[-1] == ("image.imageRotation", {})
+            assert stub.execute_calls[-1] == ("image.imageRotation.180", {})
             try:
                 await executor.execute("   ")
             except LiveError as exc:
@@ -850,7 +873,7 @@ def test_executor_down_app_is_honest():
             manager=LiveManager(bridges={}), app="photocraft", document=0
         )
         attempts = (
-            executor.execute("image.imageRotationcw"),
+            executor.execute("image.imageRotation.90cw"),
             executor.commands(),
             executor.inspect(),
             executor.save("out.png"),
@@ -878,7 +901,7 @@ def test_executor_command_error_keeps_truncated_app_text():
 
     async def go():
         with LiveStubServer(
-            command_errors={"image.mode.grayscale": long_error}
+            command_errors={"image.adjustments.desaturate": long_error}
         ) as stub:
             executor = LiveExecutor(
                 manager=LiveManager(
@@ -887,7 +910,7 @@ def test_executor_command_error_keeps_truncated_app_text():
                 app="photocraft",
             )
             try:
-                await executor.execute("image.mode.grayscale")
+                await executor.execute("image.adjustments.desaturate")
             except LiveError as exc:
                 message = str(exc)
                 assert "engine.execute failed: command refused" in message
@@ -905,6 +928,7 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
     import asyncio
 
     from controller.agent import brain_from_profile, run_agent_loop
+    from controller.commands import CommandCatalog
     from controller.documents import DocumentRegistry
     from controller.live import LiveExecutor
     from controller.llm import MockBrain
@@ -918,8 +942,12 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
                 app="photocraft",
                 document=1,
             )
+            catalog = CommandCatalog((await executor.commands())["commands"])
             plan_fn, model, is_mock = brain_from_profile(
-                None, MockBrain(), live=True, live_app="photocraft"
+                None,
+                MockBrain(catalog=catalog),
+                live=True,
+                live_app="photocraft",
             )
             events = [
                 event
@@ -932,6 +960,7 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
                     is_mock=is_mock,
                     executor=executor,
                     live_app="photocraft",
+                    catalog=catalog,
                 )
             ]
             types = [e["type"] for e in events]
@@ -940,7 +969,7 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
             assert "observe" in types and "record" in types
             calls = [e for e in events if e["type"] == "tool.call"]
             assert calls[0]["name"] == "command_run"
-            assert calls[0]["arguments"] == {"command": "image.imageRotationcw"}
+            assert calls[0]["arguments"] == {"command": "image.imageRotation.90cw"}
             assert calls[-1]["name"] == "done"
             results = [e for e in events if e["type"] == "tool.result"]
             assert results[0]["ok"] is True
@@ -951,17 +980,24 @@ def test_loop_live_rotate_hits_the_open_app(tmp_path):
                 "width": 48,
                 "height": 32,
                 "layers": 2,
-                "history": 3,
+                "layer_summary": [
+                    "Background (raster, Normal, 100%)",
+                    "copy (raster, Screen, 80%)",
+                ],
+                "history": 4,  # 3 base entries + the rotation that just ran
             }
-            assert observed["observation"]["revision"] == 3
+            # Baseline observe before the edit → the after-observe proves it.
+            assert observed["changed"] is True
+            assert observed["observation"]["revision"] == 4
             assert observed["observation"]["content_hash"].startswith("sha256:")
-            assert stub.activate_calls == [1, 1]
+            assert stub.activate_calls == [1, 1, 1]
             assert stub.execute_calls == [
-                ("image.imageRotationcw", {}),
+                ("document.inspect", {}),
+                ("image.imageRotation.90cw", {}),
                 ("document.inspect", {}),
             ]
             completed = events[-1]
-            assert "image.imageRotationcw" in completed["summary"]
+            assert "image.imageRotation.90cw" in completed["summary"]
             assert completed["records"]
 
     asyncio.run(go())
@@ -971,6 +1007,7 @@ def test_loop_live_bridge_failure_stops_honestly(tmp_path):
     import asyncio
 
     from controller.agent import brain_from_profile, run_agent_loop
+    from controller.commands import CommandCatalog
     from controller.documents import DocumentRegistry
     from controller.live import LiveExecutor
     from controller.llm import MockBrain
@@ -979,8 +1016,20 @@ def test_loop_live_bridge_failure_stops_honestly(tmp_path):
         executor = LiveExecutor(
             manager=LiveManager(bridges={}), app="photocraft", document=1
         )
+        catalog = CommandCatalog(
+            [
+                {
+                    "id": "image.imageRotation.90cw",
+                    "label": "90° Clockwise",
+                    "params": "{}",
+                }
+            ]
+        )
         plan_fn, model, is_mock = brain_from_profile(
-            None, MockBrain(), live=True, live_app="photocraft"
+            None,
+            MockBrain(catalog=catalog),
+            live=True,
+            live_app="photocraft",
         )
         events = [
             event
@@ -993,6 +1042,7 @@ def test_loop_live_bridge_failure_stops_honestly(tmp_path):
                 is_mock=is_mock,
                 executor=executor,
                 live_app="photocraft",
+                catalog=catalog,
             )
         ]
         results = [e for e in events if e["type"] == "tool.result"]
@@ -1032,11 +1082,11 @@ def test_chat_stream_live_runs_command_on_the_open_app(tmp_path, monkeypatch):
         assert names[0] == "response.started" and names[-1] == "response.completed"
         calls = [data for name, data in events if name == "tool.call"]
         assert calls[0]["name"] == "command_run"
-        assert calls[0]["args"] == {"command": "image.imageRotationcw"}
+        assert calls[0]["args"] == {"command": "image.imageRotation.90cw"}
         results = [data for name, data in events if name == "tool.result"]
         assert results[0]["ok"] is True
         assert stub.activate_calls and all(i == 1 for i in stub.activate_calls)
-        assert stub.execute_calls[0] == ("image.imageRotationcw", {})
+        assert ("image.imageRotation.90cw", {}) in stub.execute_calls
 
 
 def test_chat_stream_live_bridge_down_is_honest_error(tmp_path, monkeypatch):
