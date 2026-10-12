@@ -1,11 +1,11 @@
 /**
- * LiveApp: use a document open in a running Craft desktop app as the chat object.
+ * LiveApp: work on a document open in a running Craft desktop app.
  *
- * Why (live chat objects): the desktop app is started with `--control` and
- * the controller snapshots its window into the session on attach — the
- * returned OpenedFile binds chat exactly like an upload (same doc_id flow,
- * thumbnail, download, verify). When the app is down the exact start
- * command is shown so the user can launch it and hit Refresh.
+ * Why (live link): the desktop app is started with `--control` and the
+ * attach call links chat to the OPEN app document (source: "live") — the
+ * agent edits the live document in the app, not an imported copy. When the
+ * app is down the exact start command is shown so the user can launch it
+ * and hit Refresh.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -21,11 +21,11 @@ import {
 } from '../lib/api';
 import { logger } from '../lib/logger';
 
-function docLabel(doc: LiveDocument): string {
+function docLabel(app: string, doc: LiveDocument): string {
   const dims = doc.width != null && doc.height != null ? ` · ${doc.width}×${doc.height}` : '';
   const dirty = doc.dirty ? ' · ●unsaved' : '';
   const active = doc.active ? ' · active' : '';
-  return `${doc.name}${dims}${dirty}${active}`;
+  return `${app} · ${doc.name} (live)${dims}${dirty}${active}`;
 }
 
 export function LiveApp({
@@ -92,7 +92,7 @@ export function LiveApp({
     }
   }
 
-  async function useAsChatObject(app: string, doc: LiveDocument) {
+  async function linkAsChatObject(app: string, doc: LiveDocument) {
     setAttaching(`${app}:${doc.index}`);
     setError(null);
     try {
@@ -100,7 +100,7 @@ export function LiveApp({
       onOpened(opened);
       logger.info('live.attached', { app });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not attach the live document');
+      setError(err instanceof Error ? err.message : 'Could not link the open document');
       logger.warn('live.attach.failed', { app });
     } finally {
       setAttaching(null);
@@ -169,14 +169,14 @@ export function LiveApp({
                   const key = `${entry.app}:${doc.index}`;
                   return (
                     <li key={key}>
-                      <span title={docLabel(doc)}>{docLabel(doc)}</span>{' '}
+                      <span title={docLabel(entry.app, doc)}>{docLabel(entry.app, doc)}</span>{' '}
                       <button
                         type="button"
                         disabled={attaching === key}
-                        onClick={() => void useAsChatObject(entry.app, doc)}
-                        aria-label={`Use ${doc.name} as chat object`}
+                        onClick={() => void linkAsChatObject(entry.app, doc)}
+                        aria-label={`Work on ${doc.name} open in ${entry.app}`}
                       >
-                        {attaching === key ? 'Attaching…' : 'Use as chat object'}
+                        {attaching === key ? 'Linking…' : 'Work on this open document'}
                       </button>
                     </li>
                   );

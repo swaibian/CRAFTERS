@@ -60,8 +60,10 @@ export interface OpenedFile {
   thumbnail_url?: string;
   /** "upload" (dropped file) or "live" (captured from a running desktop app). */
   source?: string;
-  /** Desktop app the copy was captured from (source === "live" only). */
+  /** Desktop app the open document lives in (source === "live" only). */
   live_app?: string;
+  /** Engine document index of the open doc (attach only; file-info omits it). */
+  live_index?: number;
 }
 
 export interface ChatStreamRequest {
@@ -250,6 +252,7 @@ function toOpenedFile(data: Record<string, unknown>, fallbackSession: string): O
       `/api/files/${encodeURIComponent(docId)}/thumbnail?session_id=${encodeURIComponent(sessionId)}`,
     source: (data.source as string | undefined) ?? 'upload',
     live_app: data.live_app as string | undefined,
+    live_index: typeof data.live_index === 'number' ? data.live_index : undefined,
   };
 }
 export async function openFile(file: File, app: string, session_id?: string): Promise<OpenedFile> {
@@ -417,16 +420,21 @@ export interface StreamCallbacks {
 
 /**
  * Parse one SSE `data:` payload line into a StreamEvent.
+ * The controller puts the event name on the SSE `event:` line — the data
+ * JSON carries no `event` field — so the caller passes it explicitly;
+ * a legacy inline `event`/`type` field is still accepted as fallback.
  * Unknown event names return null (ignored, logged at debug).
  */
-export function parseStreamPayload(raw: string): StreamEvent | null {
-  let parsed: { event?: string } & Record<string, unknown>;
+export function parseStreamPayload(raw: string, eventName?: string): StreamEvent | null {
+  let parsed: { event?: string; type?: string } & Record<string, unknown>;
   try {
-    parsed = JSON.parse(raw) as { event?: string } & Record<string, unknown>;
+    parsed = JSON.parse(raw) as { event?: string; type?: string } & Record<string, unknown>;
   } catch {
     return null;
   }
-  const name = typeof parsed.event === 'string' ? parsed.event : (parsed.type as string | undefined);
+  const name =
+    eventName ??
+    (typeof parsed.event === 'string' ? parsed.event : (parsed.type as string | undefined));
   switch (name) {
     case 'response.started':
       return {
@@ -505,15 +513,20 @@ export function streamChat(body: ChatStreamRequest, cb: StreamCallbacks): () => 
         buffer = chunks.pop() ?? '';
         for (const chunk of chunks) {
           const lines = chunk.split('\n');
+          let eventName: string | undefined;
           for (const line of lines) {
             const trimmed = line.trim();
+            if (trimmed.startsWith('event:')) {
+              eventName = trimmed.slice(6).trim() || undefined;
+              continue;
+            }
             if (!trimmed.startsWith('data:')) continue;
             const payload = trimmed.slice(5).trim();
             if (payload === '[DONE]') {
               cb.onDone();
               return;
             }
-            const event = parseStreamPayload(payload);
+            const event = parseStreamPayload(payload, eventName);
             if (event) cb.onEvent(event);
           }
         }

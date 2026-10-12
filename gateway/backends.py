@@ -371,13 +371,24 @@ class FakeAppBackend:
 
     Implements the same ``call_tool`` / ``list_tools`` / ``status`` surface
     as :class:`AppBackend` with canned documents and jobs so the gateway,
-    tools, and tests work without pilot CLIs installed. Never used when the
-    real CLI binary is on ``PATH``.
+    tools, and tests work without pilot CLIs. Never used when the
+    real CLI binary is on ``PATH``. Shared live-agent tool names
+    (``command_run``, ``command_list``, ``doc_save``, ``look``) answer with
+    the canned shape of their shared-schema counterpart (``command_run``
+    behaves as ``engine.execute``, ``look`` as ``render_preview``).
 
     :param app: App id (e.g. ``"photocraft"``).
     """
 
-    TOOLS = ("doc_inspect", "engine.execute", "render_preview")
+    TOOLS = (
+        "doc_inspect",
+        "engine.execute",
+        "render_preview",
+        "command_run",
+        "command_list",
+        "doc_save",
+        "look",
+    )
 
     def __init__(self, app: str) -> None:
         self.app = app
@@ -413,10 +424,14 @@ class FakeAppBackend:
                     }
                 ],
             }
-        if method == "engine.execute":
+        if method in ("engine.execute", "command_run"):
             self._revision += 1
             return {"app": self.app, "ok": True, "revision": self._revision}
-        if method == "render_preview":
+        if method == "command_list":
+            return {"app": self.app, "commands": [{"id": "noop"}]}
+        if method == "doc_save":
+            return {"app": self.app, "ok": True, "path": params.get("path")}
+        if method in ("render_preview", "look"):
             return {
                 "app": self.app,
                 "revision": self._revision,
@@ -524,12 +539,17 @@ class AppBackend:
     async def call_tool(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Proxy one JSON-RPC tool call to the app CLI.
 
-        :param method: Backend method name.
+        :param method: Backend method name. Shared live-agent names reach
+            the app MCP verbatim except ``look`` — the one name the app MCP
+            spells differently (``doc_render_preview`` per the shared
+            schema, docs/bridge-runbook.md §7).
         :param params: Validated params (never logged raw).
         :returns: Backend result payload.
         """
         if self._client is None:
             raise BackendError(f"backend not connected: {self.app}")
+        if method == "look":
+            method = "doc_render_preview"
         started = time.monotonic()
         try:
             result = await self._client.call_tool(method, dict(params))
@@ -611,6 +631,18 @@ BRIDGE_METHODS = (
     "jobs.cancel",
 )
 
+#: Shared live-agent tool names (the schema the built-in chat agent uses over
+#: the controller's direct control channel; table in docs/bridge-runbook.md
+#: §7) → bridge vocabulary. Applied by :meth:`BridgeAppBackend.call_tool` so
+#: ``craft_run_tool`` offers the same names on a live ``--control`` bridge.
+#: ``doc_inspect`` needs no entry: it is already a gateway read alias there.
+SHARED_TOOL_ALIASES = {
+    "command_run": "engine.execute",
+    "command_list": "engine.commands",
+    "doc_save": "app.save",
+    "look": "render_preview",
+}
+
 
 class BridgeAppBackend:
     """Lane 3 bridge proxy: drive a running desktop app over its loopback
@@ -620,8 +652,9 @@ class BridgeAppBackend:
 
     ``call_tool`` is a verbatim control-protocol passthrough (the
     ``craft_app_call`` escape hatch: ``{app, method, params}`` → one TCP
-    JSON-lines call → reply), with two read-only aliases so the gateway's
-    own probes keep working in bridge mode:
+    JSON-lines call → reply), with the shared live-agent names mapped onto
+    control methods per :data:`SHARED_TOOL_ALIASES` and two read-only
+    aliases so the gateway's own probes keep working in bridge mode:
 
     - ``"doc_inspect"`` → ``document.inspect`` (``inspect_style="direct"``,
       gridcraft family) or ``engine.execute {"command":
@@ -673,7 +706,8 @@ class BridgeAppBackend:
     async def call_tool(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Proxy one control call (verbatim passthrough + read aliases).
 
-        :param method: Control-protocol method, or ``doc_inspect`` /
+        :param method: Control-protocol method, shared live-agent tool name
+            (mapped per :data:`SHARED_TOOL_ALIASES`), or ``doc_inspect`` /
             ``render_preview`` (gateway read aliases).
         :param params: Validated params (never logged raw).
         :returns: Reply payload (screenshot bytes reduced to metadata).
@@ -681,6 +715,7 @@ class BridgeAppBackend:
             ``ok: false`` (message forwarded — it names the method/params
             problem, never secrets).
         """
+        method = SHARED_TOOL_ALIASES.get(method, method)
         started = time.monotonic()
         try:
             if method == "render_preview":

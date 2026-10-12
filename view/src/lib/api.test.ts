@@ -15,8 +15,10 @@ import {
   loadHistory,
   openFile,
   parseStreamPayload,
+  streamChat,
   testScaicoKey,
   thumbnailUrl,
+  type StreamEvent,
 } from './api';
 
 afterEach(() => {
@@ -61,6 +63,80 @@ describe('parseStreamPayload', () => {
   it('ignores unknown events and malformed JSON', () => {
     expect(parseStreamPayload(JSON.stringify({ event: 'nope' }))).toBeNull();
     expect(parseStreamPayload('not json{{{')).toBeNull();
+  });
+
+  it('prefers the SSE event line over inline JSON event fields', () => {
+    expect(
+      parseStreamPayload(JSON.stringify({ type: 'text.delta', delta: 'ignored', name: 'command_run' }), 'tool.call'),
+    ).toEqual({ type: 'tool.call', name: 'command_run', args: {} });
+  });
+});
+
+describe('SSE wire format', () => {
+  function stubSseStream(chunks: string[]) {
+    const encoder = new TextEncoder();
+    let i = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: async () =>
+              i < chunks.length
+                ? { done: false, value: encoder.encode(chunks[i++]) }
+                : { done: true, value: undefined },
+            releaseLock: () => {},
+          }),
+        },
+      }),
+    );
+  }
+
+  function collectStream(chunks: string[]): Promise<StreamEvent[]> {
+    stubSseStream(chunks);
+    return new Promise((resolve, reject) => {
+      const events: StreamEvent[] = [];
+      streamChat(
+        { session_id: 's1', message: 'hi' },
+        {
+          onEvent: (e) => events.push(e),
+          onDone: () => resolve(events),
+          onError: (err) => reject(err),
+        },
+      );
+    });
+  }
+
+  it('routes a classic event:/data: frame', async () => {
+    await expect(collectStream(['event: tool.call\ndata: {"name":"command_run"}\n\n'])).resolves.toEqual([
+      { type: 'tool.call', name: 'command_run', args: {} },
+    ]);
+  });
+
+  it('falls back to the inline event field on bare data frames', async () => {
+    await expect(
+      collectStream(['data: {"event":"text.delta","delta":"hi"}\n\ndata: {"type":"response.completed","message_id":"m1"}\n\n']),
+    ).resolves.toEqual([
+      { type: 'text.delta', delta: 'hi' },
+      { type: 'response.completed', message_id: 'm1' },
+    ]);
+  });
+
+  it('routes mixed chunks where event line and data share or split chunk strings', async () => {
+    await expect(
+      collectStream([
+        'event: text.delta\ndata: {"delta":"a"}\n\nevent: tool.call\ndata: {"name":"command_run"}\n\n',
+        'event: response.completed\ndata: {"message_id":"m1"}\n\n',
+        'event: text.delta\n',
+        'data: {"delta":"b"}\n\n',
+      ]),
+    ).resolves.toEqual([
+      { type: 'text.delta', delta: 'a' },
+      { type: 'tool.call', name: 'command_run', args: {} },
+      { type: 'response.completed', message_id: 'm1' },
+      { type: 'text.delta', delta: 'b' },
+    ]);
   });
 });
 

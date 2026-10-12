@@ -208,3 +208,57 @@ auth rejected → token file mismatch (photocraft rotates only when the file
 is absent — keep the file); timeouts on healthy app → window occluded /
 minimised (Wayland/macOS stop rendering hidden windows — `ui.focus` first);
 `unknown method` → check `engine.commands` for the exact id.
+
+## 7. Shared tool schema (built-in chat agent ↔ external MCP clients)
+
+Decision: **both transports, shared tool schema** — the built-in chat agent
+(driving live apps over the controller's direct control channel) and external
+MCP clients (`craft_run_tool` on the gateway) use the same tool names and arg
+shapes, so the two are interchangeable. `done {summary}` is a controller-loop
+tool, never an app tool — it never reaches `craft_run_tool`.
+
+| Tool | Args | App MCP tool | Control method | Notes |
+|---|---|---|---|---|
+| `command_run` | `{command, params?}` | `command_run` | `engine.execute {command, params}` | any engine command; ids via `command_list` |
+| `command_list` | `{filter?}` | `command_list` | `engine.commands` | registry + enablement |
+| `doc_inspect` | `{}` | `doc_inspect` | `document.inspect` | document state |
+| `doc_save` | `{path?}` | `doc_save` | `app.save {path}` | explicit save only, no autosave; `path` confined to the session write root — `..`/absolute escapes are refused before the app sees them |
+| `look` | `{}` | `doc_render_preview` / `ui_screenshot` | `ui.screenshot` | screenshot/preview step |
+| `done` | `{summary}` | — | — | controller-loop only, never an app tool |
+
+Method semantics live in the app repo's `docs/control-protocol.md` (§MCP
+bridge maps the app MCP tools onto control methods; engine ids and their
+params are the `command_list` / `engine.commands` registry).
+
+`craft_run_tool {app, tool, args}` is the external-MCP entry point to this
+surface. On a headless `<app>-cli mcp` backend the gateway forwards the shared
+name and args unchanged to the app's MCP `tools/call` (the app maps onto
+control methods; `look` is spelled `doc_render_preview` there, so the gateway
+maps that one name). On a live `--control` bridge the gateway maps the shared
+names onto the control-method column itself. The built-in chat agent sends the
+very same names over the controller's direct control channel. Transitional
+note: today's app MCP `command_run` spells the command field `id`; `command`
+is the shared spelling (matching `engine.execute`) being landed with the
+schema alignment.
+
+One `command_run` through the gateway (rotate 90° clockwise), and the same
+call typed at a live app's loopback control channel:
+
+```sh
+# External MCP client → gateway (default :8787, bearer token):
+BASE=http://127.0.0.1:8787/mcp
+AUTH="Authorization: Bearer $CRAFTER_TOKEN"
+SID=$(curl -siS "$BASE" -H "$AUTH" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
+  | awk 'tolower($1)=="mcp-session-id:" {print $2}' | tr -d '\r')
+curl -sS "$BASE" -H "$AUTH" -H "Mcp-Session-Id: $SID" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"craft_run_tool","arguments":{"app":"photocraft","tool":"command_run","args":{"command":"image.imageRotation.90cw","params":{}}}}}'
+```
+
+```sh
+# Manual equivalent — engine.execute over the loopback control channel
+# (socket + auth frame per §5 step 2); the call command_run maps onto:
+{"id": 1, "method": "engine.execute", "params": {"command": "image.imageRotation.90cw", "params": {}}}
+```

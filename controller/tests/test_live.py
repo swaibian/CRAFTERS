@@ -4,9 +4,13 @@ Positive: env parsing (fault-isolated, pdfcraft skipped), status
 up/down/unconfigured, document listing against a real wire-format stub
 (gridcraft-style no-auth + photocraft-style token auth), attach → 201 with
 live provenance → thumbnail 200 → mock chat stream completes on the
-attached doc.
+attached doc. LiveExecutor + the live agent lane: activate-first commands,
+inspect/look/save against the stub, path containment, and the live chat
+stream running real commands on the open app.
 Negative: malformed env var, refused port, wrong token, unknown app,
-unknown document index, occluded window (no image payload).
+unknown document index, occluded window (no image payload), escaping
+save paths, command errors truncated, bridge down → honest error (no
+adapter fallback).
 """
 
 from __future__ import annotations
@@ -68,6 +72,13 @@ SESSION_INSPECT = {
     "document": {"name": "second.psd", "width": 48, "height": 32},
 }
 
+DOC_INSPECT = {
+    "width": 48,
+    "height": 32,
+    "layers": [{"id": 0}, {"id": 1}],
+    "history": [{"name": "open"}, {"name": "rotate"}, {"name": "blur"}],
+}
+
 
 class LiveStubServer:
     """Threaded stand-in for a desktop app's control channel.
@@ -75,12 +86,21 @@ class LiveStubServer:
     Speaks the real wire format (one ``{"id","method","params"}`` line in,
     one ``{"id","ok","result"}`` line out; optional photocraft-style auth
     frame first). Each connection runs on its own thread; ``activate_calls``
-    records ``document.activate`` targets.
+    records ``document.activate`` targets, ``execute_calls`` other
+    ``engine.execute`` commands, ``command_list_calls`` ``engine.commands``
+    filters, and ``save_calls`` ``app.save`` paths.
     """
 
-    def __init__(self, *, require_token=None, screenshot_b64=PNG_B64):
+    def __init__(
+        self,
+        *,
+        require_token=None,
+        screenshot_b64=PNG_B64,
+        command_errors=None,
+    ):
         self._require_token = require_token
         self._screenshot_b64 = screenshot_b64
+        self._command_errors = dict(command_errors or {})
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -88,6 +108,9 @@ class LiveStubServer:
         self._sock.settimeout(0.5)
         self._stop = threading.Event()
         self.activate_calls: list = []
+        self.execute_calls: list = []
+        self.command_list_calls: list = []
+        self.save_calls: list = []
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
     @property
@@ -154,18 +177,41 @@ class LiveStubServer:
     def _reply(self, msg):
         method = msg.get("method")
         params = msg.get("params") or {}
+        if method == "engine.execute":
+            command = params.get("command")
+            if command == "document.activate":
+                self.activate_calls.append((params.get("params") or {}).get("document"))
+                return {"id": msg.get("id"), "ok": True, "result": {}}
+            if command in self._command_errors:
+                return {
+                    "id": msg.get("id"),
+                    "ok": False,
+                    "error": self._command_errors[command],
+                }
+            self.execute_calls.append((command, params.get("params") or {}))
+            if command == "document.inspect":
+                return {"id": msg.get("id"), "ok": True, "result": DOC_INSPECT}
+            return {
+                "id": msg.get("id"),
+                "ok": True,
+                "result": {"name": "second.psd", "width": 48, "height": 32},
+            }
         result: object = {}
         if method == "ui.inspect":
             result = SESSION_INSPECT
         elif method == "ui.screenshot":
             result = {"image": self._screenshot_b64} if self._screenshot_b64 else {}
-        elif (
-            method == "engine.execute" and params.get("command") == "document.activate"
-        ):
-            self.activate_calls.append((params.get("params") or {}).get("document"))
-            result = {}
-        elif method == "engine.execute":
-            result = {"name": "second.psd", "width": 48, "height": 32}
+        elif method == "engine.commands":
+            self.command_list_calls.append(params.get("filter"))
+            result = {
+                "commands": [
+                    {"id": "image.imageRotationcw"},
+                    {"id": "image.mode.grayscale"},
+                ]
+            }
+        elif method == "app.save":
+            self.save_calls.append(params.get("path"))
+            result = {"path": params.get("path") or "second.psd", "warnings": []}
         return {"id": msg.get("id"), "ok": True, "result": result}
 
 
@@ -189,6 +235,21 @@ def _client(tmp_path, monkeypatch, bridges):
         live=LiveManager(bridges=bridges),
     )
     return TestClient(create_app(state))
+
+
+def _sse_events(text):
+    events = []
+    for block in text.strip().split("\n\n"):
+        name = ""
+        data = {}
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                name = line.split(": ", 1)[1]
+            elif line.startswith("data: "):
+                data = json.loads(line.split(": ", 1)[1])
+        if name:
+            events.append((name, data))
+    return events
 
 
 # --- env parsing -------------------------------------------------------------
@@ -457,7 +518,12 @@ def test_launch_gridcraft_spawns_fixed_argv_and_registers_bridge(tmp_path, monke
         res = client.post("/api/live/launch", json={"app": "gridcraft"})
         assert res.status_code == 200, res.text
         body = res.json()
-        assert body == {"app": "gridcraft", "running": True, "mode": "bridge", "pid": 4242}
+        assert body == {
+            "app": "gridcraft",
+            "running": True,
+            "mode": "bridge",
+            "pid": 4242,
+        }
         # Fixed argv: binary + --control + port only — no request data.
         assert calls and calls[0][0] == [str(exe), "--control", str(stub.port)]
         assert calls[0][1].get("start_new_session") is True
@@ -499,7 +565,9 @@ def test_launch_photocraft_writes_0600_token_and_fixed_argv(tmp_path, monkeypatc
     assert "--automation-read-root" in argv and "--automation-write-root" in argv
     token_flag = argv.index("--control-token-file")
     token_file = argv[token_flag + 1]
-    assert token_file.startswith(os.path.join(tempfile.gettempdir(), "crafter-photocraft-"))
+    assert token_file.startswith(
+        os.path.join(tempfile.gettempdir(), "crafter-photocraft-")
+    )
     mode = stat.S_IMODE(os.stat(token_file).st_mode)
     assert mode == 0o600, oct(mode)
 
@@ -512,14 +580,18 @@ def test_launch_already_running_skips_spawn(tmp_path, monkeypatch):
 
     async def go():
         with LiveStubServer() as stub:
-            manager = LiveManager(bridges={"gridcraft": _bridge("gridcraft", stub.port)})
+            manager = LiveManager(
+                bridges={"gridcraft": _bridge("gridcraft", stub.port)}
+            )
 
             def boom(*args, **kwargs):  # pragma: no cover - must not spawn
                 raise AssertionError("spawn called for a running app")
 
             with monkeypatch.context() as m:
                 m.setattr(
-                    live_mod, "LAUNCH_PORTS", {"photocraft": 7878, "gridcraft": stub.port}
+                    live_mod,
+                    "LAUNCH_PORTS",
+                    {"photocraft": 7878, "gridcraft": stub.port},
                 )
                 m.setattr(live_mod.subprocess, "Popen", boom)
                 result = await launch_app(manager, "gridcraft", timeout_s=2.0)
@@ -664,3 +736,333 @@ def test_launch_records_roots_for_screenshots(tmp_path, monkeypatch):
             assert manager.roots["gridcraft"] == str(tmp_path / "desktops")
 
     asyncio.run(go())
+
+
+# --- LiveExecutor: the live lane's command surface -----------------------------
+
+
+def test_executor_execute_activates_then_runs():
+    import asyncio
+
+    from controller.live import LiveError, LiveExecutor
+
+    async def go():
+        with LiveStubServer() as stub:
+            manager = LiveManager(
+                bridges={"photocraft": _bridge("photocraft", stub.port)}
+            )
+            executor = LiveExecutor(manager=manager, app="photocraft", document=1)
+            result = await executor.execute("image.imageRotationcw", {"angle": 90})
+            assert result["width"] == 48
+            assert stub.activate_calls == [1]
+            assert stub.execute_calls == [("image.imageRotationcw", {"angle": 90})]
+            # No linked index → no document.activate step.
+            plain = LiveExecutor(manager=manager, app="photocraft")
+            await plain.execute("image.imageRotation")
+            assert stub.activate_calls == [1]
+            assert stub.execute_calls[-1] == ("image.imageRotation", {})
+            try:
+                await executor.execute("   ")
+            except LiveError as exc:
+                assert "command id" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("expected LiveError")
+
+    asyncio.run(go())
+
+
+def test_executor_commands_inspect_look_and_save():
+    import asyncio
+
+    from controller.live import LiveExecutor
+
+    async def go():
+        with LiveStubServer() as stub:
+            executor = LiveExecutor(
+                manager=LiveManager(
+                    bridges={"photocraft": _bridge("photocraft", stub.port)}
+                ),
+                app="photocraft",
+                document=1,
+            )
+            listing = await executor.commands("rotate")
+            assert [c["id"] for c in listing["commands"]]
+            assert stub.command_list_calls == ["rotate"]
+            assert (await executor.commands())["commands"]
+            assert stub.command_list_calls[-1] is None
+            info = await executor.inspect()
+            assert info == DOC_INSPECT
+            assert stub.execute_calls == [("document.inspect", {})]
+            assert (await executor.look()) == PNG_BYTES
+            saved = await executor.save("out/deep.png")
+            assert saved["path"] == "out/deep.png"
+            assert stub.save_calls == ["out/deep.png"]
+            await executor.save(None)
+            assert stub.save_calls[-1] is None
+
+    asyncio.run(go())
+
+
+def test_executor_save_rejects_escaping_paths():
+    import asyncio
+
+    from controller.live import LiveError, LiveExecutor
+
+    async def go():
+        with LiveStubServer() as stub:
+            executor = LiveExecutor(
+                manager=LiveManager(
+                    bridges={"photocraft": _bridge("photocraft", stub.port)}
+                ),
+                app="photocraft",
+            )
+            bad_paths = (
+                "",
+                "   ",
+                "../evil.png",
+                "out/../../evil.png",
+                "/tmp/evil.png",
+                "C:/evil.png",
+                "~/evil.png",
+                "a//b.png",
+                "a/./b.png",
+                "back\\slash.png",
+            )
+            for bad in bad_paths:
+                try:
+                    await executor.save(bad)
+                except LiveError as exc:
+                    assert str(exc).startswith("doc_save path"), (bad, str(exc))
+                else:  # pragma: no cover
+                    raise AssertionError(f"expected LiveError for {bad!r}")
+            assert stub.save_calls == []
+
+    asyncio.run(go())
+
+
+def test_executor_down_app_is_honest():
+    import asyncio
+
+    from controller.live import LiveError, LiveExecutor
+
+    async def go():
+        executor = LiveExecutor(
+            manager=LiveManager(bridges={}), app="photocraft", document=0
+        )
+        attempts = (
+            executor.execute("image.imageRotationcw"),
+            executor.commands(),
+            executor.inspect(),
+            executor.save("out.png"),
+            executor.look(),
+        )
+        for attempt in attempts:
+            try:
+                await attempt
+            except LiveError as exc:
+                assert str(exc) == (
+                    "photocraft is not running — start it from the App panel or Refresh"
+                )
+            else:  # pragma: no cover
+                raise AssertionError("expected LiveError")
+
+    asyncio.run(go())
+
+
+def test_executor_command_error_keeps_truncated_app_text():
+    import asyncio
+
+    from controller.live import LiveError, LiveExecutor
+
+    long_error = "command refused: " + "x" * 400
+
+    async def go():
+        with LiveStubServer(
+            command_errors={"image.mode.grayscale": long_error}
+        ) as stub:
+            executor = LiveExecutor(
+                manager=LiveManager(
+                    bridges={"photocraft": _bridge("photocraft", stub.port)}
+                ),
+                app="photocraft",
+            )
+            try:
+                await executor.execute("image.mode.grayscale")
+            except LiveError as exc:
+                message = str(exc)
+                assert "engine.execute failed: command refused" in message
+                assert len(message) <= 230
+            else:  # pragma: no cover
+                raise AssertionError("expected LiveError")
+
+    asyncio.run(go())
+
+
+# --- agent loop on the live lane ------------------------------------------------
+
+
+def test_loop_live_rotate_hits_the_open_app(tmp_path):
+    import asyncio
+
+    from controller.agent import brain_from_profile, run_agent_loop
+    from controller.documents import DocumentRegistry
+    from controller.live import LiveExecutor
+    from controller.llm import MockBrain
+
+    async def go():
+        with LiveStubServer() as stub:
+            executor = LiveExecutor(
+                manager=LiveManager(
+                    bridges={"photocraft": _bridge("photocraft", stub.port)}
+                ),
+                app="photocraft",
+                document=1,
+            )
+            plan_fn, model, is_mock = brain_from_profile(
+                None, MockBrain(), live=True, live_app="photocraft"
+            )
+            events = [
+                event
+                async for event in run_agent_loop(
+                    "rotate the picture clockwise",
+                    doc_id=None,
+                    registry=DocumentRegistry(tmp_path / "work"),
+                    plan_fn=plan_fn,
+                    model_name=model,
+                    is_mock=is_mock,
+                    executor=executor,
+                    live_app="photocraft",
+                )
+            ]
+            types = [e["type"] for e in events]
+            assert types[0] == "run.started" and types[-1] == "run.completed"
+            assert "tool.call" in types and "tool.result" in types
+            assert "observe" in types and "record" in types
+            calls = [e for e in events if e["type"] == "tool.call"]
+            assert calls[0]["name"] == "command_run"
+            assert calls[0]["arguments"] == {"command": "image.imageRotationcw"}
+            assert calls[-1]["name"] == "done"
+            results = [e for e in events if e["type"] == "tool.result"]
+            assert results[0]["ok"] is True
+            observed = next(e for e in events if e["type"] == "observe")
+            assert observed["observation"]["kind"] == "live"
+            assert observed["observation"]["app"] == "photocraft"
+            assert observed["observation"]["detail"] == {
+                "width": 48,
+                "height": 32,
+                "layers": 2,
+                "history": 3,
+            }
+            assert observed["observation"]["revision"] == 3
+            assert observed["observation"]["content_hash"].startswith("sha256:")
+            assert stub.activate_calls == [1, 1]
+            assert stub.execute_calls == [
+                ("image.imageRotationcw", {}),
+                ("document.inspect", {}),
+            ]
+            completed = events[-1]
+            assert "image.imageRotationcw" in completed["summary"]
+            assert completed["records"]
+
+    asyncio.run(go())
+
+
+def test_loop_live_bridge_failure_stops_honestly(tmp_path):
+    import asyncio
+
+    from controller.agent import brain_from_profile, run_agent_loop
+    from controller.documents import DocumentRegistry
+    from controller.live import LiveExecutor
+    from controller.llm import MockBrain
+
+    async def go():
+        executor = LiveExecutor(
+            manager=LiveManager(bridges={}), app="photocraft", document=1
+        )
+        plan_fn, model, is_mock = brain_from_profile(
+            None, MockBrain(), live=True, live_app="photocraft"
+        )
+        events = [
+            event
+            async for event in run_agent_loop(
+                "rotate the picture clockwise",
+                doc_id=None,
+                registry=DocumentRegistry(tmp_path / "work"),
+                plan_fn=plan_fn,
+                model_name=model,
+                is_mock=is_mock,
+                executor=executor,
+                live_app="photocraft",
+            )
+        ]
+        results = [e for e in events if e["type"] == "tool.result"]
+        assert results[0]["name"] == "command_run"
+        assert results[0]["ok"] is False
+        assert "is not running" in results[0]["error"]
+        assert events[-1]["type"] == "run.completed"
+        assert "could not complete" in events[-1]["summary"]
+
+    asyncio.run(go())
+
+
+# --- chat stream on the live lane ----------------------------------------------
+
+
+def test_chat_stream_live_runs_command_on_the_open_app(tmp_path, monkeypatch):
+    with LiveStubServer() as stub:
+        client = _client(
+            tmp_path, monkeypatch, {"gridcraft": _bridge("gridcraft", stub.port)}
+        )
+        attached = client.post(
+            "/api/live/attach",
+            json={"session_id": "live-chat", "app": "gridcraft", "document": 1},
+        )
+        assert attached.status_code == 201, attached.text
+        stream = client.post(
+            "/api/chat/stream",
+            json={
+                "session_id": "live-chat",
+                "doc_id": attached.json()["doc_id"],
+                "message": "rotate the picture clockwise",
+            },
+        )
+        assert stream.status_code == 200, stream.text
+        events = _sse_events(stream.text)
+        names = [name for name, _ in events]
+        assert names[0] == "response.started" and names[-1] == "response.completed"
+        calls = [data for name, data in events if name == "tool.call"]
+        assert calls[0]["name"] == "command_run"
+        assert calls[0]["args"] == {"command": "image.imageRotationcw"}
+        results = [data for name, data in events if name == "tool.result"]
+        assert results[0]["ok"] is True
+        assert stub.activate_calls and all(i == 1 for i in stub.activate_calls)
+        assert stub.execute_calls[0] == ("image.imageRotationcw", {})
+
+
+def test_chat_stream_live_bridge_down_is_honest_error(tmp_path, monkeypatch):
+    with LiveStubServer() as stub:
+        client = _client(
+            tmp_path, monkeypatch, {"gridcraft": _bridge("gridcraft", stub.port)}
+        )
+        attached = client.post(
+            "/api/live/attach",
+            json={"session_id": "live-down", "app": "gridcraft", "document": 1},
+        )
+        assert attached.status_code == 201, attached.text
+        doc_id = attached.json()["doc_id"]
+    # The app went away after the attach: the chat must fail honestly and
+    # never fall back to editing the imported copy.
+    stream = client.post(
+        "/api/chat/stream",
+        json={
+            "session_id": "live-down",
+            "doc_id": doc_id,
+            "message": "rotate the picture clockwise",
+        },
+    )
+    events = _sse_events(stream.text)
+    names = [name for name, _ in events]
+    assert names == ["response.error"]
+    errors = [data for name, data in events if name == "response.error"]
+    assert "is not running" in errors[0]["message"]
+    assert not [data for name, data in events if name == "tool.call"]

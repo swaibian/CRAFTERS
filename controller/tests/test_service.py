@@ -589,7 +589,10 @@ def test_profiles_list_carries_active_id(client):
             "default_model": "m",
         },
     )
-    assert created.json()["profile"]["id"] == client.get("/api/settings/profiles").json()["active_profile_id"]
+    assert (
+        created.json()["profile"]["id"]
+        == client.get("/api/settings/profiles").json()["active_profile_id"]
+    )
     assert "sk-CANARY-1111" not in client.get("/api/settings/profiles").text
 
 
@@ -598,9 +601,14 @@ def test_files_open_inspect_compat_aliases(client):
     assert body["app"] == body["kind"] == "photo"
     assert body["name"] == body["source_name"] == "pic.png"
     assert body["session_id"] == "lane4"
-    assert body["thumbnail_url"] == f"/api/files/{body['doc_id']}/thumbnail?session_id=lane4"
+    assert (
+        body["thumbnail_url"]
+        == f"/api/files/{body['doc_id']}/thumbnail?session_id=lane4"
+    )
 
-    inspect = client.get(f"/api/files/{body['doc_id']}", params={"session_id": "lane4"}).json()
+    inspect = client.get(
+        f"/api/files/{body['doc_id']}", params={"session_id": "lane4"}
+    ).json()
     assert inspect["app"] == "photo"
     assert inspect["name"] == "pic.png"
     assert inspect["session_id"] == "lane4"
@@ -608,16 +616,25 @@ def test_files_open_inspect_compat_aliases(client):
 
 def test_thumbnail_photo_pdf_sheet(client):
     photo = _open_png(client, "thumb-photo")
-    thumb = client.get(f"/api/files/{photo['doc_id']}/thumbnail", params={"session_id": "thumb-photo"})
+    thumb = client.get(
+        f"/api/files/{photo['doc_id']}/thumbnail", params={"session_id": "thumb-photo"}
+    )
     assert thumb.status_code == 200
     assert thumb.content[:4] == b"\x89PNG"
 
     # Cross-session isolation: same doc id, different session → 404.
     assert (
-        client.get(f"/api/files/{photo['doc_id']}/thumbnail", params={"session_id": "other"}).status_code
+        client.get(
+            f"/api/files/{photo['doc_id']}/thumbnail", params={"session_id": "other"}
+        ).status_code
         == 404
     )
-    assert client.get("/api/files/doc_nope/thumbnail", params={"session_id": "lane4"}).status_code == 404
+    assert (
+        client.get(
+            "/api/files/doc_nope/thumbnail", params={"session_id": "lane4"}
+        ).status_code
+        == 404
+    )
 
     # Sheets have no pixels → honest 404 (view keeps the inspect summary).
     import io as _io
@@ -630,11 +647,20 @@ def test_thumbnail_photo_pdf_sheet(client):
     wb.save(buf)
     sheet = client.post(
         "/api/files/open",
-        files={"file": ("s.xlsx", buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        files={
+            "file": (
+                "s.xlsx",
+                buf.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
         data={"session_id": "thumb-sheet"},
     ).json()
     assert (
-        client.get(f"/api/files/{sheet['doc_id']}/thumbnail", params={"session_id": "thumb-sheet"}).status_code
+        client.get(
+            f"/api/files/{sheet['doc_id']}/thumbnail",
+            params={"session_id": "thumb-sheet"},
+        ).status_code
         == 404
     )
 
@@ -643,14 +669,18 @@ def test_sse_compat_payload_keys(client):
     body = _open_png(client, "sse-compat")
     stream = client.post(
         "/api/chat/stream",
-        json={"message": "resize to 800px", "session_id": "sse-compat", "doc_id": body["doc_id"]},
+        json={
+            "message": "resize to 800px",
+            "session_id": "sse-compat",
+            "doc_id": body["doc_id"],
+        },
     )
     events = _sse_events(stream.text)
     calls = [data for name, data in events if name == "tool.call"]
     results = [data for name, data in events if name == "tool.result"]
     assert calls and "args" in calls[0] and "call_id" in calls[0]
     assert results and "summary" in results[0] and "error" in results[0]
-    completed = [data for name, data in events if name == "response.completed"][0]
+    completed = next(data for name, data in events if name == "response.completed")
     assert completed["message_id"] == completed["run_id"]
     assert completed["records"]
 
@@ -659,26 +689,50 @@ def test_verify_snapshot_restore_record_view(client):
     body = _open_png(client, "verify-sess")
     doc_id = body["doc_id"]
 
-    snap = client.post("/api/verify/snapshot", json={"session_id": "verify-sess", "doc_id": doc_id})
+    snap = client.post(
+        "/api/verify/snapshot", json={"session_id": "verify-sess", "doc_id": doc_id}
+    )
     assert snap.json() == {"ok": True, "summary": "Snapshot revision 2."}
 
     # Mutate via chat (mock brain resize), then restore to the snapshot.
     client.post(
         "/api/chat/stream",
-        json={"message": "resize to 800px", "session_id": "verify-sess", "doc_id": doc_id},
+        json={
+            "message": "resize to 800px",
+            "session_id": "verify-sess",
+            "doc_id": doc_id,
+        },
     )
-    restored = client.post("/api/verify/restore", json={"session_id": "verify-sess", "doc_id": doc_id})
+    restored = client.post(
+        "/api/verify/restore", json={"session_id": "verify-sess", "doc_id": doc_id}
+    )
     assert restored.json()["ok"] is True
 
-    record = client.post("/api/verify/record-view", json={"session_id": "verify-sess", "doc_id": doc_id})
+    record = client.post(
+        "/api/verify/record-view", json={"session_id": "verify-sess", "doc_id": doc_id}
+    )
     assert record.json()["ok"] is True
     assert "revision" in record.json()["summary"]
 
     # Isolation + error shapes: unknown doc → 404, unknown session doc → 404.
-    assert client.post("/api/verify/snapshot", json={"session_id": "verify-sess", "doc_id": "doc_nope"}).status_code == 404
-    assert client.post("/api/verify/record-view", json={"session_id": "verify-sess", "doc_id": "doc_nope"}).status_code == 404
+    assert (
+        client.post(
+            "/api/verify/snapshot",
+            json={"session_id": "verify-sess", "doc_id": "doc_nope"},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/verify/record-view",
+            json={"session_id": "verify-sess", "doc_id": "doc_nope"},
+        ).status_code
+        == 404
+    )
     leaked = (
-        snap.text + restored.text + record.text
+        snap.text
+        + restored.text
+        + record.text
         + client.post("/api/verify/snapshot", json={"session_id": "verify-sess"}).text
     )
     assert "sk-" not in leaked and "api_key" not in leaked

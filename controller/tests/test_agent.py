@@ -1,7 +1,9 @@
 """SWE4 tests: agent loop with MockBrain + LlmClient parsing.
 
 Positive: edit request → ops executed → observed → record ledger non-empty;
-run.completed summary; done-call path.
+run.completed summary; done-call path. Live lane: MockBrain live patterns
+map onto the app command surface and brain_from_profile(live=True)
+advertises LIVE_APP_TOOLS with the live system prompt.
 Negative: empty message, no document open, unknown tool, oversized budget
 stop; measured-without-evidence rejected; LlmError paths (auth/transport).
 """
@@ -82,6 +84,107 @@ def test_mockbrain_team_prefix():
     # No team → no prefix (backward compatible).
     plain = brain.plan("tell me a story", doc_kind="photo")
     assert not plain.text.startswith("[team ")
+
+
+@pytest.mark.parametrize(
+    ("message", "arguments"),
+    [
+        (
+            "rotate the picture clockwise",
+            {"command": "image.imageRotationcw"},
+        ),
+        ("rotate 90 clockwise", {"command": "image.imageRotationcw"}),
+        ("rotate the canvas counter", {"command": "image.imageRotationccw"}),
+        ("rotate counterclockwise", {"command": "image.imageRotationccw"}),
+        ("rotate 180", {"command": "image.imageRotation"}),
+        ("make it grayscale", {"command": "image.mode.grayscale"}),
+        ("convert to black and white", {"command": "image.mode.grayscale"}),
+        (
+            "blur the image",
+            {"command": "filter.blur.gaussianBlur", "params": {"radius": 3}},
+        ),
+    ],
+)
+def test_mockbrain_live_command_run_patterns(message, arguments):
+    """Live mode maps edit phrasing onto the app's command surface."""
+    brain = MockBrain()
+    plan = brain.plan(message, live=True)
+    assert plan.mock is True and plan.model == "mock"
+    assert plan.tool_calls and plan.tool_calls[0].name == "command_run"
+    assert plan.tool_calls[0].arguments == arguments
+
+
+def test_mockbrain_live_save_and_done():
+    brain = MockBrain()
+    save_plan = brain.plan("please save the document", live=True)
+    assert save_plan.tool_calls[0].name == "doc_save"
+    other = brain.plan("tell me a story", live=True)
+    assert other.tool_calls[0].name == "done"
+    assert other.tool_calls[0].arguments["summary"]
+    followup = brain.plan(
+        "Done so far: Ran image.imageRotationcw in the open app. "
+        "Original request: rotate the picture clockwise.",
+        live=True,
+    )
+    assert followup.tool_calls[0].name == "done"
+
+
+def test_mockbrain_adapter_mode_unchanged_for_live_phrasing():
+    """Adapter planning is untouched: live phrasing still maps to adapters."""
+    brain = MockBrain()
+    plan = brain.plan("rotate the picture clockwise", doc_kind="photo")
+    assert plan.tool_calls[0].name == "photo.transform"
+
+
+def test_brain_from_profile_live_uses_live_tools(monkeypatch):
+    """live=True advertises LIVE_APP_TOOLS and the live system prompt."""
+    import httpx
+
+    from controller.llm import AGENT_TOOLS, LIVE_APP_TOOLS
+
+    seen: dict = {}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        seen["tools"] = json["tools"]
+        seen["system"] = json["messages"][0]["content"]
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"choices": [{"message": {"content": "done"}}]}
+
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    class _Profile:
+        api_base = "http://127.0.0.1:9/v1"
+        api_key = "k"
+        default_model = "m"
+
+    plan_fn, model_name, is_mock = brain_from_profile(
+        _Profile(), live=True, live_app="photocraft"
+    )
+    assert is_mock is False and model_name == "m"
+    plan_fn("rotate the picture clockwise", "photo")
+    assert seen["tools"] is LIVE_APP_TOOLS
+    assert "photocraft" in seen["system"]
+    assert "command surface" in seen["system"]
+    assert "doc_save ONLY" in seen["system"]
+
+    # Headless lane keeps the adapter prompt + adapter tools.
+    headless_fn, _, _ = brain_from_profile(_Profile())
+    headless_fn("hi", "photo")
+    assert seen["tools"] is AGENT_TOOLS
+    assert "open document copy" in seen["system"]
+
+    # The no-key path plans live commands too.
+    mock_fn, mock_model, mock_flag = brain_from_profile(None, live=True)
+    assert mock_flag is True and mock_model == "mock"
+    plan = mock_fn("rotate the picture clockwise", "photo")
+    assert plan.tool_calls[0].name == "command_run"
+    assert plan.tool_calls[0].arguments == {"command": "image.imageRotationcw"}
 
 
 def test_brain_from_profile_team_and_model_override(monkeypatch):

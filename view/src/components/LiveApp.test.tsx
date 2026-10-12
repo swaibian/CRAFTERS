@@ -74,8 +74,9 @@ describe('LiveApp', () => {
 
     await user.click(screen.getByRole('button', { name: /list open documents/i }));
     await waitFor(() => expect(screen.getByText(/second\.psd/)).toBeInTheDocument());
+    expect(screen.getByText(/photocraft · second\.psd \(live\)/)).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: /use second\.psd as chat object/i }));
+    await user.click(screen.getByRole('button', { name: /work on second\.psd open in photocraft/i }));
     await waitFor(() => expect(onOpened).toHaveBeenCalledOnce());
     expect(onOpened.mock.calls[0]?.[0]).toMatchObject({ doc_id: 'd9', source: 'live' });
   });

@@ -10,11 +10,16 @@ user can attach them as the chat object.
 V1 model (import, read-first): attaching snapshots the live window via
 ``ui.screenshot`` into the session work dir and registers it as a normal
 photo document with ``source="live"`` provenance. Chat, thumbnail,
-download, snapshot/restore, and the agent edit loop then work unchanged —
-they operate on the attached copy, never on the user's live window.
-Live-window editing (reference model) is explicitly out of scope: edits
-must stay visible, verifiable, and reversible, which only the local copy
-gives today.
+download, and snapshot/restore then work unchanged on the attached copy.
+
+Live editing lane: :class:`LiveExecutor` drives the linked document in the
+user's OPEN window through the app's own command surface
+(``engine.execute`` / ``engine.commands`` / ``app.save``) so agent edits
+are immediately visible in the live app. The imported copy is never
+mutated in this lane, and the user's file is only written when the agent
+explicitly calls ``doc_save`` (``app.save`` — ``file.save`` is refused by
+the control channel). When the bridge is down the lane fails honestly
+("app is not running") instead of falling back to the copy.
 
 Config: per-app ``CRAFTER_BRIDGE_<APP>=host:port`` plus optional
 ``CRAFTER_BRIDGE_<APP>_TOKEN_FILE`` (photocraft-style bearer token),
@@ -84,6 +89,9 @@ LAUNCH_TIMEOUT_S = 45.0
 _SCREENSHOT_KEYS = ("base64", "image", "png", "data", "screenshot")
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: Windows drive/stream prefix (``C:``/``c:``) refused for automation paths.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 class LiveError(Exception):
@@ -381,6 +389,131 @@ class LiveManager:
             await client.close()
 
 
+@dataclass
+class LiveExecutor:
+    """Drive one linked live document through its app's command surface.
+
+    The agent loop's live lane: every tool call runs a real command in the
+    user's OPEN desktop window (``engine.execute``) so the effect is
+    immediately visible there. The linked engine document is activated
+    before each command (``document.activate``, same pattern as
+    :meth:`LiveManager.screenshot_png`). Nothing is written to the user's
+    file unless :meth:`save` is called — ``app.save`` is the only allowed
+    write (``file.save`` is refused by the control channel; see the app's
+    ``docs/control-protocol.md``).
+
+    :param manager: Live manager holding the app's bridge config + write root.
+    :param app: App id (e.g. ``"photocraft"``).
+    :param document: Linked engine document index (activated before every
+        command; None = leave the window's active document alone).
+    """
+
+    manager: LiveManager
+    app: str
+    document: int | None = None
+
+    async def execute(
+        self, command: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Run one command id on the linked document (activate-first).
+
+        :param command: Engine/UI command id (e.g. ``image.imageRotationcw``,
+            ``document.inspect``).
+        :param params: Command params object (``{}`` when none).
+        :returns: The command's result payload.
+        :raises LiveError: Empty command id, app down, or the app refused
+            the command (app error text truncated; never params/pixels).
+        """
+        if not str(command).strip():
+            raise LiveError("command_run needs a command id")
+        if self.document is not None:
+            await self._invoke(
+                "engine.execute",
+                {
+                    "command": "document.activate",
+                    "params": {"document": self.document},
+                },
+            )
+        return await self._invoke(
+            "engine.execute", {"command": command, "params": params or {}}
+        )
+
+    async def commands(self, filter: str | None = None) -> dict[str, Any]:
+        """List the app's command registry with params docs + enablement.
+
+        :param filter: Optional substring filter (None = whole registry).
+        :returns: The ``engine.commands`` result payload.
+        :raises LiveError: App down or the call failed.
+        """
+        params = {"filter": filter} if filter else {}
+        return await self._invoke("engine.commands", params)
+
+    async def inspect(self) -> dict[str, Any]:
+        """Inspect the linked document (layer tree, history, dims).
+
+        Runs ``document.inspect`` through ``engine.execute`` — the desktop
+        control channel's safe path (the ``doc.inspect`` method is the
+        headless-server spelling of the same JSON).
+
+        :returns: The inspection payload (``width``, ``height``, ``layers``,
+            ``history``, ...).
+        :raises LiveError: App down or the call failed.
+        """
+        return await self.execute("document.inspect")
+
+    async def save(self, path: str | None = None) -> dict[str, Any]:
+        """Save the linked document via ``app.save`` (write-root confined).
+
+        Without ``path`` the app writes back to the document's own file
+        (like File › Save). A ``path`` must be a relative forward-slash
+        path under the app's automation write root — absolute paths,
+        ``~``, backslashes and ``..`` traversal are refused locally before
+        the round trip (mirroring the app's automation containment).
+
+        :param path: Optional relative target path.
+        :returns: The ``app.save`` result payload (``path`` written,
+            ``warnings``).
+        :raises LiveError: Path escapes the write root, app down, or the
+            app refused the save.
+        """
+        params = {"path": _confine_write_path(path)} if path is not None else {}
+        return await self._invoke("app.save", params)
+
+    async def look(self) -> bytes:
+        """Capture the live window as PNG bytes (never logged).
+
+        :returns: Raw PNG bytes.
+        :raises LiveError: App down or the window could not be captured.
+        """
+        try:
+            return await self.manager.screenshot_png(self.app, document=self.document)
+        except LiveError as exc:
+            error = _channel_error(self.app, "look", exc)
+            log.warning(
+                "live call failed: %s",
+                safe_event(event="live_call", app=self.app, error=str(error), ok=False),
+            )
+            raise error from exc
+
+    async def _invoke(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """One authenticated control call on the linked app.
+
+        :param method: Control-protocol method.
+        :param params: Method params.
+        :returns: The reply's ``result`` payload.
+        :raises LiveError: Honest failure (app down vs. method error).
+        """
+        try:
+            return await self.manager._call(self.app, method, params)
+        except LiveError as exc:
+            error = _channel_error(self.app, method, exc)
+            log.warning(
+                "live call failed: %s",
+                safe_event(event="live_call", app=self.app, error=str(error), ok=False),
+            )
+            raise error from exc
+
+
 def live_manager_from_env() -> LiveManager:
     """Build a :class:`LiveManager` from the process environment.
 
@@ -558,7 +691,10 @@ async def launch_app(
             except OSError:
                 pass
             raise LiveError(f"could not write {app} token file") from None
-    argv = [binary, *desktop_launch_argv(app, token_file=token_file, work_root=work_root)]
+    argv = [
+        binary,
+        *desktop_launch_argv(app, token_file=token_file, work_root=work_root),
+    ]
     log_path = os.path.join(work_root, f"crafter-{app}.log")
     proc = _spawn_detached(argv, log_path, spawn=spawn)
     pid = getattr(proc, "pid", None)
@@ -597,6 +733,52 @@ def sanitize_filename(name: str) -> str:
     """
     stem = re.sub(r"[^\w.-]+", "_", name).strip("._") or "live"
     return stem[:40]
+
+
+def _confine_write_path(path: str) -> str:
+    """Validate a ``doc_save`` path against the app's automation write rules.
+
+    Mirrors the app's containment (relative forward-slash paths under the
+    write root only — absolute paths, ``..`` and escaping paths are
+    refused; see ``docs/control-protocol.md``) with a local pre-check so
+    the agent gets a clear error before the round trip.
+
+    :param path: Candidate save path.
+    :returns: The unchanged relative path.
+    :raises LiveError: Empty, absolute, backslashed, or traversal path.
+    """
+    cleaned = str(path).strip()
+    if not cleaned:
+        raise LiveError("doc_save path must not be empty")
+    if "\\" in cleaned:
+        raise LiveError("doc_save path must use forward slashes")
+    if cleaned.startswith(("/", "~")) or _DRIVE_RE.match(cleaned):
+        raise LiveError(
+            "doc_save path must be relative (inside the app's automation write root)"
+        )
+    if any(part in ("", ".", "..") for part in cleaned.split("/")):
+        raise LiveError(
+            "doc_save path must stay inside the app's automation write root"
+        )
+    return cleaned
+
+
+def _channel_error(app: str, method: str, exc: LiveError) -> LiveError:
+    """Turn a channel/protocol failure into an honest, truncated LiveError.
+
+    :param app: App id.
+    :param method: Control method attempted.
+    :param exc: Underlying failure.
+    :returns: LiveError naming the app as not running, or the failing
+        method with the app's error text (truncated to 200 chars — log-safe,
+        never pixels/params).
+    """
+    message = str(exc)
+    if message.startswith("cannot reach") or "is not running" in message:
+        return LiveError(
+            f"{app} is not running — start it from the App panel or Refresh"
+        )
+    return LiveError(f"{method} failed: {message[:200]}")
 
 
 def _optional_int(value: Any) -> int | None:
@@ -658,6 +840,7 @@ __all__ = [
     "START_HINTS",
     "LiveDocument",
     "LiveError",
+    "LiveExecutor",
     "LiveManager",
     "LiveStatus",
     "desktop_launch_argv",

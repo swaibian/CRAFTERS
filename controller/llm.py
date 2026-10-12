@@ -5,9 +5,10 @@
   + tool schemas and parses ``tool_calls``; keys travel in the
   ``Authorization`` header only and are never logged.
 - :class:`MockBrain` — deterministic rule-based planner used when no profile
-  is configured: emits tool calls for edit requests (resize/rotate/cell ops)
-  so the whole agent loop works with no key. Every plan is labeled
-  ``mock`` so callers (and the view) can show the fallback state.
+  is configured: emits tool calls for edit requests (resize/rotate/cell ops,
+  or live command-surface ops in live mode) so the whole agent loop works
+  with no key. Every plan is labeled ``mock`` so callers (and the view) can
+  show the fallback state.
 
 SW-REQ: SW-REQ-STREAM (LiteLLM-direct-style completions path, TC-B).
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +60,34 @@ class LlmPlan:
 
 class LlmError(Exception):
     """LLM call failed (transport, auth, or bad payload — safe message)."""
+
+
+def _upstream_error_detail(response: Any) -> str:
+    """Extract a short, log-safe upstream error detail (no key material).
+
+    Providers answer 400 with a JSON ``{error: {message}}`` or
+    ``{message}`` body. Only the first 200 chars of the message/code are
+    kept; anything that looks like a secret is dropped.
+
+    :param response: httpx response with a 4xx/5xx status.
+    :returns: Short detail string or ``""`` when nothing safe is present.
+    """
+    try:
+        payload = response.json()
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    raw: Any = payload.get("error", payload.get("message", ""))
+    if isinstance(raw, dict):
+        raw = raw.get("message", raw.get("code", ""))
+    text = str(raw or "").strip().replace("\n", " ")
+    if not text:
+        return ""
+    lowered = text.lower()
+    if any(part in lowered for part in ("api_key", "apikey", "bearer", "sk-")):
+        return "upstream rejected the request"
+    return text[:200]
 
 
 # --- tool schemas advertised to the model ------------------------------------
@@ -142,6 +172,125 @@ AGENT_TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+#: Tool schemas for the live-app lane: the model drives the user's OPEN
+#: desktop document through the app's own command/MCP surface
+#: (``engine.execute``/``engine.commands``/``app.save`` on the control
+#: channel). Edits are visible in the open window immediately; the user's
+#: file is written only by an explicit ``doc_save``.
+LIVE_APP_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "command_run",
+            "description": (
+                "Run one command of the open app's own command surface on the "
+                "user's OPEN document — the effect is visible immediately in "
+                "the app window. E.g. image.imageRotationcw rotates 90 degrees "
+                "clockwise, image.imageRotationccw counter-clockwise, "
+                "image.imageRotation 180 degrees, image.mode.grayscale converts "
+                "to grayscale, filter.blur.gaussianBlur blurs. Discover command "
+                "ids and their params with command_list first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command id, e.g. image.imageRotationcw.",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": (
+                            "Command params object (omit when the command takes "
+                            "none; see command_list for each command's params)."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "command_list",
+            "description": (
+                "List the open app's full command registry (ids, labels, "
+                "parameter docs, enablement) to discover its functionality. "
+                "An optional filter narrows by substring."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional substring filter on command ids.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "doc_inspect",
+            "description": (
+                "Inspect the user's OPEN document in the live app (layer "
+                "tree, history, dimensions) to verify what an edit did."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "doc_save",
+            "description": (
+                "Save the user's OPEN document. ONLY call this when the user "
+                "explicitly asks to save — visible edits need no save. The "
+                "optional path must be a relative path inside the app's "
+                "automation write root; without path the document's own file "
+                "is written back."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Optional relative target path under the app's "
+                            "write root (never absolute, never ..)."
+                        ),
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "look",
+            "description": (
+                "Capture the open app's window so you can see the current "
+                "state of the user's document and verify edits visually."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "done",
+            "description": "Finish the run with a summary for the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
 
 class LlmClient:
     """OpenAI-compatible chat-completions client for one profile.
@@ -191,9 +340,15 @@ class LlmClient:
             "tools": tools if tools is not None else AGENT_TOOLS,
             "tool_choice": "auto",
         }
+        started = time.monotonic()
         log.info(
             "llm request: %s",
-            safe_event(event="llm_request", count=len(messages), ok=True),
+            safe_event(
+                event="llm_request",
+                count=len(messages),
+                model=str(body["model"]),
+                ok=True,
+            ),
         )
         try:
             response = httpx.post(
@@ -203,11 +358,47 @@ class LlmClient:
                 timeout=self._timeout,
             )
         except httpx.HTTPError as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            log.warning(
+                "llm transport failed: %s",
+                safe_event(
+                    event="llm_error",
+                    model=str(body["model"]),
+                    error="transport failed",
+                    duration_ms=duration_ms,
+                    ok=False,
+                ),
+            )
             raise LlmError("llm transport failed") from exc
+        duration_ms = int((time.monotonic() - started) * 1000)
         if response.status_code == 401:
+            log.warning(
+                "llm auth rejected: %s",
+                safe_event(
+                    event="llm_error",
+                    model=str(body["model"]),
+                    status=response.status_code,
+                    error="auth rejected",
+                    duration_ms=duration_ms,
+                    ok=False,
+                ),
+            )
             raise LlmError("llm auth rejected (check profile key)")
         if response.status_code >= 400:
-            raise LlmError(f"llm request failed: status {response.status_code}")
+            detail = _upstream_error_detail(response)
+            suffix = f": {detail}" if detail else ""
+            log.warning(
+                "llm request failed: %s",
+                safe_event(
+                    event="llm_error",
+                    model=str(body["model"]),
+                    status=response.status_code,
+                    error=detail or f"status {response.status_code}",
+                    duration_ms=duration_ms,
+                    ok=False,
+                ),
+            )
+            raise LlmError(f"llm request failed: status {response.status_code}{suffix}")
         try:
             payload = response.json()
             message = payload["choices"][0]["message"]
@@ -237,7 +428,14 @@ class LlmClient:
         )
         log.info(
             "llm plan: %s",
-            safe_event(event="llm_plan", count=len(calls), ok=True),
+            safe_event(
+                event="llm_plan",
+                model=str(body["model"]),
+                count=len(calls),
+                duration_ms=duration_ms,
+                status=response.status_code,
+                ok=True,
+            ),
         )
         return plan
 
@@ -315,6 +513,19 @@ class MockBrain:
     - ``add sheet <name>`` → ``sheet.add_sheet``.
     - ``delete page <N>`` → ``pdf.transform delete``.
     - Anything else → a clarifying question (no tool calls).
+
+    Live mode (``live=True``) plans against the app's command surface
+    instead of the adapters:
+
+    - ``rotate ... clockwise`` / ``rotate 90`` → ``command_run
+      image.imageRotationcw``.
+    - ``rotate ... counter...`` → ``command_run image.imageRotationccw``.
+    - ``rotate 180`` → ``command_run image.imageRotation``.
+    - ``grayscale`` / ``black and white`` → ``command_run
+      image.mode.grayscale``.
+    - ``blur`` → ``command_run filter.blur.gaussianBlur {radius: 3}``.
+    - ``save`` → ``doc_save``.
+    - Anything else → ``done`` with a summary.
     """
 
     def __init__(self) -> None:
@@ -331,6 +542,7 @@ class MockBrain:
         doc_kind: str = "",
         history: str = "",
         team_id: str | None = None,
+        live: bool = False,
     ) -> LlmPlan:
         """Plan tool calls for a user message (deterministic, no network).
 
@@ -340,6 +552,8 @@ class MockBrain:
         :param team_id: Owning team id (prefixes the reply ``[team <id>]`` so
             the team binding is visible even on the no-key path; requirement:
             team must be behaviorally real, not just accepted).
+        :param live: Plan against the live-app command surface
+            (:data:`LIVE_APP_TOOLS`) instead of the document adapters.
         :returns: :class:`LlmPlan` with ``mock=True``.
         """
         _ = history
@@ -357,6 +571,9 @@ class MockBrain:
             summary = followup.group(1).strip() or "Done."
             calls.append(self._call("done", {"summary": summary}))
             return LlmPlan(text="", tool_calls=calls, mock=True, model="mock")
+
+        if live:
+            return self._plan_live(text, lowered, team_id)
 
         width: int | None = None
         height: int | None = None
@@ -476,5 +693,75 @@ class MockBrain:
         )
         return plan
 
+    def _plan_live(
+        self, text: str, lowered: str, team_id: str | None = None
+    ) -> LlmPlan:
+        """Plan one live-app command for a user message (deterministic).
 
-__all__ = ["AGENT_TOOLS", "LlmClient", "LlmError", "LlmPlan", "MockBrain", "ToolCall"]
+        Maps edit phrasing onto the open app's command surface (never the
+        document adapters — the live lane must not touch the imported copy).
+
+        :param text: Stripped user message.
+        :param lowered: Lowercased message for pattern matching.
+        :param team_id: Owning team id (prefixes the reply when set).
+        :returns: :class:`LlmPlan` with ``mock=True`` and one tool call.
+        """
+        calls: list[ToolCall] = []
+        if "rotat" in lowered:
+            if "counter" in lowered or "anti" in lowered:
+                calls.append(
+                    self._call("command_run", {"command": "image.imageRotationccw"})
+                )
+                reply = "Rotating the open document counterclockwise."
+            elif "180" in lowered:
+                calls.append(
+                    self._call("command_run", {"command": "image.imageRotation"})
+                )
+                reply = "Rotating the open document 180 degrees."
+            else:
+                calls.append(
+                    self._call("command_run", {"command": "image.imageRotationcw"})
+                )
+                reply = "Rotating the open document clockwise."
+        elif "grayscale" in lowered or "black and white" in lowered:
+            calls.append(self._call("command_run", {"command": "image.mode.grayscale"}))
+            reply = "Converting the open document to grayscale."
+        elif "blur" in lowered:
+            calls.append(
+                self._call(
+                    "command_run",
+                    {
+                        "command": "filter.blur.gaussianBlur",
+                        "params": {"radius": 3},
+                    },
+                )
+            )
+            reply = "Blurring the open document."
+        elif "save" in lowered:
+            calls.append(self._call("doc_save", {}))
+            reply = "Saving the open document."
+        else:
+            summary = (
+                "No live edit matched; tell me what to change in the open app document."
+            )
+            calls.append(self._call("done", {"summary": summary}))
+            reply = summary
+        if team_id:
+            reply = f"[team {team_id}] {reply}"
+        plan = LlmPlan(text=reply, tool_calls=calls, mock=True, model="mock")
+        log.info(
+            "mock plan: %s",
+            safe_event(event="mock_plan", count=len(calls), ok=True),
+        )
+        return plan
+
+
+__all__ = [
+    "AGENT_TOOLS",
+    "LIVE_APP_TOOLS",
+    "LlmClient",
+    "LlmError",
+    "LlmPlan",
+    "MockBrain",
+    "ToolCall",
+]

@@ -10,7 +10,11 @@
 #   ./start.sh                  # start all three, open browser, Ctrl+C to stop
 #   ./start.sh --no-open        # don't open the browser
 #   ./start.sh --no-view        # gateway + controller only
+#   ./start.sh --stop           # kill the stack and exit (no start)
 #   ./start.sh --help           # all options
+#
+# Pre-start cleanup (default on): stale holders of the three ports are stopped
+# automatically; foreign processes are only killed with --force.
 #
 # Logs: .local-run/<service>.log
 # Data: controller/work/ (session files), controller/settings.local.json (keys)
@@ -27,6 +31,9 @@ VIEW_PORT="8791"
 OPEN_BROWSER=1
 WITH_VIEW=1
 WITH_GATEWAY=1
+AUTO_CLEANUP=1
+FORCE_KILL=0
+STOP_ONLY=0
 
 usage() {
   sed -n '2,16p' "$0"
@@ -39,6 +46,9 @@ usage() {
   echo "  --no-gateway         skip the MCP gateway"
   echo "  --no-view            skip the web UI"
   echo "  --no-open            don't open the browser"
+  echo "  --no-cleanup         don't kill stale processes on the ports (default: auto-cleanup)"
+  echo "  --force              kill whatever holds the ports, even if not ours"
+  echo "  --stop               kill our services (or port holders) and exit, don't start"
   echo "  --help               this text"
 }
 
@@ -51,6 +61,9 @@ while [[ $# -gt 0 ]]; do
     --no-gateway) WITH_GATEWAY=0; shift ;;
     --no-view) WITH_VIEW=0; shift ;;
     --no-open) OPEN_BROWSER=0; shift ;;
+    --no-cleanup) AUTO_CLEANUP=0; shift ;;
+    --force) FORCE_KILL=1; shift ;;
+    --stop) STOP_ONLY=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -61,6 +74,70 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 have python3 || die "python3 not found"
 [[ $WITH_VIEW -eq 0 ]] || { have node || die "node not found"; have npm || die "npm not found"; }
+
+port_busy() { python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('$HOST',$1))==0 else 1)" 2>/dev/null; }
+
+# -- Pre-start cleanup: reclaim stale ports ------------------------------------
+pids_on_port() { # pids_on_port <port> — PIDs in LISTEN state only
+  local port="$1"
+  if have lsof; then
+    lsof -ti "tcp:${port}" -sTCP:LISTEN 2>/dev/null || true
+  fi
+}
+
+proc_cmd() { ps -p "$1" -o command= 2>/dev/null || echo "?"; }
+
+is_ours() { # is_ours <cmdline> — is this one of our stack processes?
+  case "$1" in
+    *gateway.main*|*controller.service*|*Crafters/view*|*vite*|*uvicorn*controller*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+reclaim_port() { # reclaim_port <port> <label> — TERM→KILL holders, wait for free
+  local port="$1" label="$2" pids pid cmd foreign=0
+  port_busy "$port" || return 0
+  pids="$(pids_on_port "$port")"
+  if [[ -z "$pids" ]]; then
+    echo "→ port $port ($label) busy but holder PID not found — waiting briefly…"
+    for _ in $(seq 1 10); do port_busy "$port" || return 0; sleep 0.5; done
+    die "port $port ($label) still busy — process holder unknown (try --force or lsof -ti tcp:$port)"
+  fi
+  for pid in $pids; do
+    cmd="$(proc_cmd "$pid")"
+    if is_ours "$cmd"; then
+      echo "→ reclaiming port $port ($label): stopping stale ours PID $pid ($cmd)"
+    else
+      foreign=1
+      echo "→ port $port ($label) held by foreign PID $pid ($cmd)"
+    fi
+  done
+  if [[ $foreign -eq 1 && $FORCE_KILL -eq 0 ]]; then
+    die "port $port ($label) held by a foreign process — refusing to kill (use --force to override, or --no-cleanup to fail fast)"
+  fi
+  [[ $foreign -eq 1 ]] && echo "→ --force: killing foreign holder(s) on port $port ($label): $pids"
+  for pid in $pids; do
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 10); do port_busy "$port" || { echo "✓ port $port ($label) free"; return 0; }; sleep 0.5; done
+  # Escalate to SIGKILL (npm/vite may not forward TERM).
+  for pid in $pids; do
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    pkill -9 -P "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 10); do port_busy "$port" || { echo "✓ port $port ($label) free"; return 0; }; sleep 0.5; done
+  die "port $port ($label) still busy after kill — check lsof -ti tcp:$port"
+}
+
+if [[ $STOP_ONLY -eq 1 ]]; then
+  echo "→ stop mode: reclaiming stack ports…"
+  [[ $WITH_GATEWAY -eq 1 ]] && reclaim_port "$GW_PORT" "gateway"
+  reclaim_port "$CTRL_PORT" "controller"
+  [[ $WITH_VIEW -eq 1 ]] && reclaim_port "$VIEW_PORT" "view"
+  echo "✓ stopped (ports free)"
+  exit 0
+fi
 
 mkdir -p "$LOG_DIR" "$WORK_DIR"
 
@@ -155,7 +232,11 @@ cleanup() {
 }
 trap cleanup INT TERM HUP EXIT
 
-port_busy() { python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('$HOST',$1))==0 else 1)" 2>/dev/null; }
+if [[ $AUTO_CLEANUP -eq 1 ]]; then
+  [[ $WITH_GATEWAY -eq 1 ]] && reclaim_port "$GW_PORT" "gateway"
+  reclaim_port "$CTRL_PORT" "controller"
+  [[ $WITH_VIEW -eq 1 ]] && reclaim_port "$VIEW_PORT" "view"
+fi
 
 wait_for() { # wait_for <url> <label> — up to ~30s
   local url="$1" label="$2" i

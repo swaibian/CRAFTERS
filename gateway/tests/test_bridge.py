@@ -17,6 +17,7 @@ import hashlib
 import json
 import struct
 import zlib
+from typing import Self
 
 import pytest
 
@@ -77,7 +78,7 @@ class StubControlServer:
         assert self._server is not None
         return self._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
 
-    async def __aenter__(self) -> StubControlServer:
+    async def __aenter__(self) -> Self:
         self._server = await asyncio.start_server(
             self._handle, "127.0.0.1", 0
         )
@@ -146,13 +147,10 @@ class StubControlServer:
                 {"id": mid, "ok": True,
                  "result": {"commands": [{"id": "cell.set"}, {"id": "file.new"}]}}
             )
-        elif method == "document.inspect":
-            await send(
-                {"id": mid, "ok": True,
-                 "result": {"revision": 7,
-                            "documents": [{"index": 0, "path": "book.xlsx"}]}}
-            )
-        elif method == "engine.execute" and params.get("command") == "document.inspect":
+        elif method == "document.inspect" or (
+            method == "engine.execute"
+            and params.get("command") == "document.inspect"
+        ):
             await send(
                 {"id": mid, "ok": True,
                  "result": {"revision": 7,
@@ -162,6 +160,11 @@ class StubControlServer:
             await send(
                 {"id": mid, "ok": True,
                  "result": {"ran": params.get("command")}}
+            )
+        elif method == "app.save":
+            await send(
+                {"id": mid, "ok": True,
+                 "result": {"path": params.get("path"), "warnings": []}}
             )
         elif method == "ui.screenshot":
             await send(
@@ -375,6 +378,32 @@ async def test_bridge_backend_doc_inspect_engine_style() -> None:
         finally:
             await backend.close()
     assert info["revision"] == 7
+
+
+@pytest.mark.asyncio()
+async def test_bridge_backend_shared_names_map_to_control_methods() -> None:
+    """Shared live-agent names reach the wire as their control methods."""
+    async with StubControlServer() as server:
+        backend = BridgeAppBackend(cfg(server.port))
+        await backend.connect()
+        try:
+            ran = await backend.call_tool(
+                "command_run", {"command": "image.imageRotation.90cw", "params": {}})
+            commands = await backend.call_tool("command_list", {"filter": "image"})
+            saved = await backend.call_tool("doc_save", {"path": "out.pcraft"})
+            meta = await backend.call_tool("look", {})
+        finally:
+            await backend.close()
+    methods = [json.loads(line)["method"] for line in server.received]
+    assert methods == ["engine.execute", "engine.commands", "app.save", "ui.screenshot"]
+    assert json.loads(server.received[0])["params"] == {
+        "command": "image.imageRotation.90cw",
+        "params": {},
+    }
+    assert ran == {"ran": "image.imageRotation.90cw"}
+    assert commands["commands"] == [{"id": "cell.set"}, {"id": "file.new"}]
+    assert saved == {"path": "out.pcraft", "warnings": []}
+    assert meta["source"] == "bridge-window"
 
 
 @pytest.mark.asyncio()

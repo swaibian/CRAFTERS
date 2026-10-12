@@ -45,6 +45,7 @@ from .live import (
     LIVE_APPS,
     START_HINTS,
     LiveError,
+    LiveExecutor,
     LiveManager,
     launch_app,
     live_manager_from_env,
@@ -259,10 +260,67 @@ def fetch_profile_models(
     return (models, False)
 
 
+def resolve_chat_model(
+    profile: Any | None,
+    requested_model: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve the model for one chat run (no network on this path).
+
+    Rules:
+
+    - explicit ``model`` override wins as-is (the endpoint validates it
+      against the live list and answers 400 when unknown — see below);
+    - else the profile's ``default_model`` when non-blank;
+    - else ``None`` (the caller falls back to the provider's first live
+      model, or fails closed with a 400 naming the missing default).
+
+    ``profile_id`` in the request body is honored: when it names a stored
+    profile, that profile — not the server-side active pointer — drives
+    the run. The view sends it on every message (see ``App.tsx``), so a
+    stale active pointer can never silently bill the wrong endpoint.
+
+    :param profile: Server-side profile (or None for MockBrain).
+    :param requested_model: Explicit ``model`` override (or None).
+    :returns: ``(resolved_model_or_None, error_or_None)`` — ``error`` is
+        set only when no usable model exists (empty default + no request).
+    """
+    if requested_model:
+        return (requested_model, None)
+    if profile is None:
+        return (None, None)
+    default = str(getattr(profile, "default_model", "") or "").strip()
+    if default:
+        return (default, None)
+    return (
+        None,
+        (
+            "no default model configured for this profile — "
+            "set one in Settings (Default model) or pick a model in chat"
+        ),
+    )
+
+
+def resolve_profile(
+    settings: Any,
+    requested_profile_id: str | None,
+) -> tuple[Any | None, str | None]:
+    """Resolve which profile drives one chat run.
+
+    :param settings: :class:`SettingsStore`.
+    :param requested_profile_id: ``profile_id`` from the request body.
+    :returns: ``(profile_or_None, error_or_None)`` — a named-but-unknown
+        id is a 400 (fail closed: never silently use another endpoint).
+    """
+    if requested_profile_id:
+        profile = settings.get_profile(str(requested_profile_id))
+        if profile is None:
+            return (None, "unknown profile")
+        return (profile, None)
+    return (settings.active_profile(), None)
+
+
 def resolve_team(team_id: str | None) -> dict[str, Any] | None:
     """Resolve a chat ``team_id`` against ``list_teams()`` (behaviorally real).
-
-    :param team_id: Requested team id (None/"" = no team).
     :returns: The team summary, or None when no team was requested.
     :raises HTTPException: 400 unknown team.
     """
@@ -788,8 +846,10 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         session_id = str(payload.get("session_id", "default"))
         registry = owned.registry_for(session_id)
         doc_id = payload.get("doc_id")
-        doc = registry.get(str(doc_id)) if doc_id else next(
-            iter(registry._docs.values()), None
+        doc = (
+            registry.get(str(doc_id))
+            if doc_id
+            else next(iter(registry._docs.values()), None)
         )
         if doc is None:
             raise HTTPException(status_code=404, detail="unknown document")
@@ -797,7 +857,9 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         log.info(
             "verify snapshot: %s",
             safe_event(
-                event="verify_snapshot", session_id=session_id, revision=revision,
+                event="verify_snapshot",
+                session_id=session_id,
+                revision=revision,
                 ok=True,
             ),
         )
@@ -817,8 +879,10 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         session_id = str(payload.get("session_id", "default"))
         registry = owned.registry_for(session_id)
         doc_id = payload.get("doc_id")
-        doc = registry.get(str(doc_id)) if doc_id else next(
-            iter(registry._docs.values()), None
+        doc = (
+            registry.get(str(doc_id))
+            if doc_id
+            else next(iter(registry._docs.values()), None)
         )
         if doc is None:
             raise HTTPException(status_code=404, detail="unknown document")
@@ -834,7 +898,9 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         log.info(
             "verify restore: %s",
             safe_event(
-                event="verify_restore", session_id=session_id, revision=revision,
+                event="verify_restore",
+                session_id=session_id,
+                revision=revision,
                 ok=True,
             ),
         )
@@ -865,9 +931,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         rev = f"revision {doc.revision}" if doc is not None else "no document open"
         return {
             "ok": True,
-            "summary": (
-                f"{users} user / {assistants} assistant messages, {rev}."
-            ),
+            "summary": (f"{users} user / {assistants} assistant messages, {rev}."),
         }
 
     # -- conversations: sidebar backend (derived from history + registries) ---
@@ -954,29 +1018,63 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         doc_id = payload.get("doc_id")
         requested_model = payload.get("model")
         requested_team = payload.get("team_id")
+        requested_profile_id = payload.get("profile_id")
         if not message.strip():
             raise HTTPException(status_code=400, detail="message is required")
         registry = owned.registry_for(session_id)
-        if doc_id is not None and registry.get(str(doc_id)) is None:
+        open_doc = registry.get(str(doc_id)) if doc_id is not None else None
+        if doc_id is not None and open_doc is None:
             raise HTTPException(status_code=404, detail="unknown document")
         team = resolve_team(str(requested_team) if requested_team is not None else None)
         team_id = str(team["id"]) if team else None
-        profile = owned.settings.active_profile()
-        resolved_model: str | None = str(requested_model) if requested_model else None
-        if profile is not None and requested_model:
+        profile, profile_error = resolve_profile(
+            owned.settings,
+            str(requested_profile_id) if requested_profile_id else None,
+        )
+        if profile_error is not None:
+            raise HTTPException(status_code=400, detail=profile_error)
+        profile_id = profile.id if profile else ""
+        resolved_model, model_error = resolve_chat_model(
+            profile, str(requested_model) if requested_model else None
+        )
+        if profile is not None and model_error is not None:
+            raise HTTPException(status_code=400, detail=model_error)
+        if profile is not None and resolved_model:
             try:
                 live_models, _cached = fetch_profile_models(
                     profile, timeout=MODELS_RESOLVE_TIMEOUT_S
                 )
             except ModelsFetchError:
                 live_models = []  # fetch failed → allow requested; chat errors honestly
-            if live_models and resolved_model not in live_models:
-                raise HTTPException(status_code=400, detail="unknown model")
+            if not live_models:
+                # No list to validate against (unreachable endpoint): default
+                # the empty-default profile to the first live model when the
+                # fetch recovers below, else chat errors honestly.
+                pass
+            elif resolved_model not in live_models:
+                if requested_model:
+                    raise HTTPException(status_code=400, detail="unknown model")
+                # Stored default drifted (renamed/retired upstream): fall
+                # back to the first live model instead of sending a dead id.
+                resolved_model = live_models[0]
+                log.info(
+                    "chat model fallback: %s",
+                    safe_event(
+                        event="model_fallback",
+                        profile_id=profile_id,
+                        model=resolved_model,
+                        ok=True,
+                    ),
+                )
+        is_live = bool(open_doc and open_doc.source == "live" and open_doc.live_app)
+        live_app = str(open_doc.live_app or "") if is_live and open_doc else ""
         plan_fn, model_name, is_mock = brain_from_profile(
             profile,
             owned._mock,
             model_override=resolved_model,
             team=team,
+            live=is_live,
+            live_app=live_app,
         )
         owned.append_history(
             session_id, "user", message, team=team_id, model=model_name
@@ -985,7 +1083,38 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         async def _stream() -> Any:
             run_id = ""
             assistant_text = ""
-            try:
+            executor: LiveExecutor | None = None
+            live_error = ""
+            if is_live:
+                status = await owned.live.status(live_app)
+                if status.running:
+                    executor = LiveExecutor(
+                        manager=owned.live,
+                        app=live_app,
+                        document=open_doc.live_index if open_doc else None,
+                    )
+                else:
+                    live_error = (
+                        f"{live_app} is not running — start it from the "
+                        "App panel or Refresh"
+                    )
+
+            async def _events() -> Any:
+                if live_error:
+                    # Honest refusal for live docs with a dead bridge — never
+                    # fall back to editing the imported copy.
+                    log.warning(
+                        "live chat refused: %s",
+                        safe_event(
+                            event="chat_live_down",
+                            app=live_app,
+                            session_id=session_id,
+                            error=live_error,
+                            ok=False,
+                        ),
+                    )
+                    yield {"type": "run.error", "message": live_error}
+                    return
                 async for event in run_agent_loop(
                     message,
                     doc_id=str(doc_id) if doc_id else None,
@@ -994,7 +1123,13 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                     model_name=model_name,
                     is_mock=is_mock,
                     session_id=session_id,
+                    executor=executor,
+                    live_app=live_app,
                 ):
+                    yield event
+
+            try:
+                async for event in _events():
                     etype = event.get("type", "")
                     if etype == "run.started":
                         run_id = str(event.get("run_id", ""))
@@ -1078,6 +1213,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             safe_event(
                 event="chat_stream",
                 session_id=session_id,
+                profile_id=profile_id,
                 model=model_name,
                 team=team_id or "",
                 ok=True,
@@ -1104,6 +1240,8 @@ __all__ = [
     "app",
     "create_app",
     "fetch_profile_models",
+    "resolve_chat_model",
+    "resolve_profile",
     "resolve_team",
     "sse_frame",
 ]

@@ -90,6 +90,21 @@ async def test_real_backend_read_only_inspect(app: str) -> None:
 
 
 @pytest.mark.asyncio()
+async def test_real_backend_shared_look_maps_to_doc_render_preview() -> None:
+    """Shared ``look`` reaches the app MCP as ``doc_render_preview``."""
+    _require_binary("photocraft")
+    backend = AppBackend("photocraft")
+    await backend.connect()
+    try:
+        await backend.call_tool("doc_new", {"width": 8, "height": 8})
+        result = await backend.call_tool("look", {})
+    finally:
+        await backend.close()
+    assert isinstance(result, dict), "look returned non-dict"
+    assert "sha256:fake" not in str(result), "look smells canned-fake"
+
+
+@pytest.mark.asyncio()
 @pytest.mark.parametrize("app", PILOT_APPS)
 async def test_real_backend_status_mode(app: str) -> None:
     """Real status must be available with a non-fake mode."""

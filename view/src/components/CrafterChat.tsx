@@ -28,6 +28,8 @@ export function CrafterChat({
   answeringModel,
   selectedModel,
   onModelChange,
+  activeProfileDefaultModel,
+  liveHint,
   verifyAvailable,
   onSend,
   onCancel,
@@ -48,6 +50,10 @@ export function CrafterChat({
   /** Currently selected model override (composer select). */
   selectedModel?: string | null;
   onModelChange?: (model: string | null) => void;
+  /** Profile's stored default (button shows the id, not "profile default"). */
+  activeProfileDefaultModel?: string | null;
+  /** "Working on app · doc N (live)" for source === "live" chat objects. */
+  liveHint?: string | null;
   verifyAvailable: Record<string, boolean>;
   onSend: (text: string, imageDataUrl?: string) => void;
   onCancel: () => void;
@@ -129,6 +135,7 @@ export function CrafterChat({
         <ModelPicker
           models={models}
           selected={selectedModel ?? null}
+          activeProfileDefaultModel={activeProfileDefaultModel ?? null}
           disabled={!profileId || (modelsLoading && models.length === 0)}
           loading={modelsLoading}
           noProfile={!profileId}
@@ -152,13 +159,14 @@ export function CrafterChat({
                 aria-hidden="true"
                 className="msg-avatar"
               />
-            )}            {m.role === 'user' ? (
+            )}
+            {m.role === 'user' ? (
               <>
                 {m.text && <p>{m.text}</p>}
                 {m.imageUrl && <img src={m.imageUrl} alt={m.imageAlt ?? 'Attached image'} className="chat-img" />}
               </>
             ) : (
-              <>
+              <div className="msg-body">
                 {(m.blocks ?? []).map((b) => {
                   if (b.kind === 'text') return <Markdown key={b.id} text={b.text} />;
                   if (b.kind === 'reasoning')
@@ -190,7 +198,7 @@ export function CrafterChat({
                     {m.error}
                   </p>
                 )}
-              </>
+              </div>
             )}
           </article>
         ))}
@@ -271,8 +279,13 @@ export function CrafterChat({
           {attachError}
         </p>
       )}
+      {liveHint && (
+        <p className="muted tiny" data-testid="live-hint">
+          {liveHint}
+        </p>
+      )}
       <p className="muted tiny">
-        session: {sessionId ?? '—'} · {selectedModel ?? 'profile default'} · {profileLabel ?? profileId ?? 'default'} · team: {teamId ?? '—'}
+        session: {sessionId ?? '—'} · {selectedModel ?? activeProfileDefaultModel ?? 'profile default'} · {profileLabel ?? profileId ?? 'default'} · team: {teamId ?? '—'}
       </p>
     </section>
   );

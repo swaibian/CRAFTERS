@@ -76,10 +76,15 @@ export function Sidebar({
   activeSessionId,
   onNewChat,
   onResume,
+  open = true,
+  onOpenChange,
 }: {
   activeSessionId: string | null;
   onNewChat: () => void;
   onResume: (sessionId: string, messages: ChatMessage[], opened: OpenedFile | null) => void;
+  /** Collapsed state (controlled by App). When false, renders the compact rail. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -144,8 +149,43 @@ export function Sidebar({
 
   const groups = groupConversations(conversations);
 
+  if (!open) {
+    return (
+      <div className="rail" aria-label="Collapsed conversations panel" data-testid="sidebar-rail">
+        <button
+          type="button"
+          className="rail-btn"
+          onClick={() => onOpenChange?.(true)}
+          aria-label="Expand conversations panel"
+          title="Expand conversations panel"
+        >
+          ›
+        </button>
+        <span className="rail-label" aria-hidden="true">
+          Chats
+        </span>
+      </div>
+    );
+  }
+
   return (
     <nav className="sidebar" aria-label="Conversations" data-testid="sidebar">
+      <div className="panel-top">
+        <span className="panel-title" id="convs-panel-title">
+          Chats
+        </span>
+        <button
+          type="button"
+          className="collapse-btn"
+          onClick={() => onOpenChange?.(false)}
+          aria-label="Collapse conversations panel"
+          aria-controls="convs-panel"
+          title="Collapse conversations panel"
+        >
+          ‹
+        </button>
+      </div>
+      <div id="convs-panel" aria-labelledby="convs-panel-title" className="panel-body">
       <button type="button" className="plaza-button-primary" onClick={onNewChat}>
         New chat
       </button>
@@ -204,6 +244,7 @@ export function Sidebar({
       {!loading && conversations.length === 0 && !error && (
         <p className="muted tiny">No conversations yet.</p>
       )}
+      </div>
     </nav>
   );
 }

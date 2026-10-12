@@ -25,6 +25,26 @@ describe('Markdown', () => {
     expect(screen.getByRole('table')).toBeInTheDocument();
     expect(document.querySelector('code')).toHaveTextContent('const x = 1;');
   });
+
+  it('renders headings', () => {
+    render(<Markdown text={'# Title\n\n## Section'} />);
+    expect(screen.getByRole('heading', { level: 1, name: 'Title' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 2, name: 'Section' })).toBeInTheDocument();
+  });
+
+  it('renders bullet and numbered lists', () => {
+    render(<Markdown text={'- one\n- two\n\n1. first\n2. second'} />);
+    const lists = screen.getAllByRole('list');
+    expect(lists).toHaveLength(2);
+    expect(screen.getAllByRole('listitem').map((li) => li.textContent)).toEqual(['one', 'two', 'first', 'second']);
+  });
+
+  it('renders links and inline code', () => {
+    render(<Markdown text={'See [docs](https://example.com) and run `craft_look`.'} />);
+    const link = screen.getByRole('link', { name: 'docs' });
+    expect(link).toHaveAttribute('href', 'https://example.com');
+    expect(document.querySelector('code')).toHaveTextContent('craft_look');
+  });
 });
 
 describe('ToolcallBlockView', () => {

@@ -13,6 +13,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 export function ModelPicker({
   models,
   selected,
+  activeProfileDefaultModel,
   disabled,
   loading,
   noProfile,
@@ -20,6 +21,8 @@ export function ModelPicker({
 }: {
   models: string[];
   selected: string | null;
+  /** Effective profile default (shown when no override is picked). */
+  activeProfileDefaultModel?: string | null;
   disabled: boolean;
   loading: boolean;
   noProfile: boolean;
@@ -33,9 +36,10 @@ export function ModelPicker({
 
   const q = query.trim().toLowerCase();
   const filtered = q ? models.filter((m) => m.toLowerCase().includes(q)) : models;
+  const defaultLabel = activeProfileDefaultModel || 'profile default';
   // Profile-default row only when the query is empty or matches it —
   // otherwise a nonsense query would never reach the empty state.
-  const showDefault = !noProfile && (q === '' || 'profile default'.includes(q));
+  const showDefault = !noProfile && (q === '' || defaultLabel.toLowerCase().includes(q));
   const rows: (string | null)[] = [...(showDefault ? [null as null] : []), ...filtered];
 
   useEffect(() => {
@@ -62,7 +66,7 @@ export function ModelPicker({
     return () => document.removeEventListener('keydown', onKey);
   }, [open ]);
 
-  const current = noProfile ? 'mock brain' : (selected ?? 'profile default');
+  const current = noProfile ? 'mock brain' : (selected ?? defaultLabel);
   const buttonTitle = noProfile
     ? 'mock brain — pick a profile in Settings'
     : loading && models.length === 0
@@ -158,7 +162,7 @@ export function ModelPicker({
                     pick(m);
                   }}
                 >
-                  {m ?? 'profile default'}
+                  {m ?? defaultLabel}
                 </li>
               ))}
             </ul>
