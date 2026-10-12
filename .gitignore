@@ -1,0 +1,45 @@
+.DS_Store
+view/node_modules/*
+.opencode/*
+Scaico_Teams/example/timeattack_vehicle_dynamics_2026-10-11T18-10-42.json
+.env
+
+# --- Python (controller/, gateway/, Scaico_Teams/) ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage*
+
+# --- Node / Vite (view/) ---
+**/node_modules/
+view/dist/
+view/coverage/
+view/*.tsbuildinfo
+view/.vite/
+
+# --- Local config & secrets (keeps tokens/keys out of git) ---
+*.local.json
+.env.*
+!.env.example
+*.pem
+
+# --- Runtime / local runs / uploads ---
+.local-run/
+controller/work/
+*.log
+
+# --- IDE & editors ---
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+Thumbs.db
+._*
