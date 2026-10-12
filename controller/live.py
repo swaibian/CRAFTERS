@@ -272,6 +272,19 @@ class LiveManager:
             raw_active = session.get("active")
             if isinstance(raw_active, int):
                 active = raw_active
+        # GridCraft exposes workbook tabs at the top level, using array
+        # position as the window index and `title` as the display name.
+        if isinstance(reply.get("documents"), list):
+            documents = [
+                LiveDocument(
+                    index=index,
+                    name=str(entry.get("title") or entry.get("name") or f"workbook {index}"),
+                    dirty=bool(entry.get("dirty", False)),
+                )
+                for index, entry in enumerate(reply["documents"])
+                if isinstance(entry, dict)
+            ]
+            active = _optional_int(reply.get("activeDocument"))
         if (
             not documents
             and isinstance(reply, dict)
@@ -326,8 +339,13 @@ class LiveManager:
                 await self._call(
                     app,
                     "engine.execute",
-                    {"command": "document.activate", "params": {"document": document}},
+                    _activation_args(app, document),
                 )
+        if app == "gridcraft":
+            # egui screenshots require a rendered frame; an occluded macOS
+            # window can answer inspections while never completing capture.
+            await self._call(app, "ui.focus", {})
+            await asyncio.sleep(0.2)
         shot_dir = self.roots.get(app) or tempfile.gettempdir()
         fd, shot_path = tempfile.mkstemp(
             prefix=f"crafter-shot-{app}-", suffix=".png", dir=shot_dir
@@ -429,10 +447,7 @@ class LiveExecutor:
         if self.document is not None:
             await self._invoke(
                 "engine.execute",
-                {
-                    "command": "document.activate",
-                    "params": {"document": self.document},
-                },
+                _activation_args(self.app, self.document),
             )
         return await self._invoke(
             "engine.execute", {"command": command, "params": params or {}}
@@ -465,6 +480,10 @@ class LiveExecutor:
             ``history``, ...).
         :raises LiveError: App down or the call failed.
         """
+        if self.app == "gridcraft":
+            if self.document is not None:
+                await self._invoke("engine.execute", _activation_args(self.app, self.document))
+            return await self._invoke("document.inspect", {})
         return await self.execute("document.inspect")
 
     async def save(self, path: str | None = None) -> dict[str, Any]:
@@ -739,6 +758,13 @@ def sanitize_filename(name: str) -> str:
     """
     stem = re.sub(r"[^\w.-]+", "_", name).strip("._") or "live"
     return stem[:40]
+
+
+def _activation_args(app: str, index: int) -> dict[str, Any]:
+    """Translate a linked document index into the app's activation contract."""
+    if app == "gridcraft":
+        return {"command": "window.activate", "params": {"index": index}}
+    return {"command": "document.activate", "params": {"document": index}}
 
 
 def _command_entries(raw: Any) -> list[Any]:

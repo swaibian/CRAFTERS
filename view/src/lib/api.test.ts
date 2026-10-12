@@ -9,6 +9,7 @@ import {
   downloadResultUrl,
   fetchConversations,
   fetchDiagnostics,
+  fetchLiveDocuments,
   fetchOpenedFile,
   fetchProfileModels,
   fetchTeams,
@@ -23,6 +24,14 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+it('shows the controller explanation when live document discovery fails', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    ok: false, status: 502,
+    json: async () => ({ detail: 'GridCraft control channel is unavailable' }),
+  }));
+  await expect(fetchLiveDocuments('gridcraft')).rejects.toThrow('GridCraft control channel is unavailable');
 });
 
 describe('parseStreamPayload', () => {

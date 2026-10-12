@@ -112,10 +112,14 @@ class LiveStubServer:
         require_token=None,
         screenshot_b64=PNG_B64,
         command_errors=None,
+        ui_inspect=None,
+        document_inspect=None,
     ):
         self._require_token = require_token
         self._screenshot_b64 = screenshot_b64
         self._command_errors = dict(command_errors or {})
+        self._ui_inspect = ui_inspect if ui_inspect is not None else SESSION_INSPECT
+        self._document_inspect = document_inspect if document_inspect is not None else DOC_INSPECT
         self._mutations: list = []
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -195,8 +199,9 @@ class LiveStubServer:
         params = msg.get("params") or {}
         if method == "engine.execute":
             command = params.get("command")
-            if command == "document.activate":
-                self.activate_calls.append((params.get("params") or {}).get("document"))
+            if command in {"document.activate", "window.activate"}:
+                inner = params.get("params") or {}
+                self.activate_calls.append(inner.get("document", inner.get("index")))
                 return {"id": msg.get("id"), "ok": True, "result": {}}
             if command in self._command_errors:
                 return {
@@ -221,7 +226,9 @@ class LiveStubServer:
             }
         result: object = {}
         if method == "ui.inspect":
-            result = SESSION_INSPECT
+            result = self._ui_inspect
+        elif method == "document.inspect":
+            result = self._document_inspect
         elif method == "ui.screenshot":
             result = {"image": self._screenshot_b64} if self._screenshot_b64 else {}
         elif method == "engine.commands":

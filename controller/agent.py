@@ -1001,6 +1001,11 @@ def _live_detail(info: dict[str, Any]) -> dict[str, Any]:
         the keys that parsed.
     """
     detail: dict[str, Any] = {}
+    # Workbook state is already structured and bounded by sheet metadata,
+    # not by cell content. Preserve it for GridCraft targeting and reasoning.
+    for key in ("title", "activeSheet", "activeCell", "selection", "dirty", "calcMode", "sheets", "names"):
+        if key in info:
+            detail[key] = info[key]
     for key in ("activeLayer", "selectedLayers", "hasSelection", "selectionBounds", "revision", "mode", "depth"):
         if key in info:
             detail[key] = info[key]
@@ -1095,6 +1100,8 @@ async def _observe_live(executor: LiveExecutor) -> dict[str, Any]:
         observation["revision"] = info["revision"]
     elif isinstance(history, list):
         observation["revision"] = len(history)
+    elif isinstance(info.get("undo"), list):
+        observation["revision"] = len(info["undo"])
     try:
         canonical = json.dumps(info, sort_keys=True, default=str).encode("utf-8")
         observation["content_hash"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"

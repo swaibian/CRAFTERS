@@ -106,7 +106,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     logger.warn('api.http-error', { path, status: res.status });
-    throw new ApiError(`Request failed: ${path} (${res.status})`, { status: res.status });
+    let message = `Request failed: ${path} (${res.status})`;
+    try {
+      const body = await res.json() as { detail?: string };
+      if (typeof body.detail === 'string' && body.detail) message = body.detail;
+    } catch {
+      // Non-JSON error responses retain the route/status fallback.
+    }
+    throw new ApiError(message, { status: res.status });
   }
   return (await res.json()) as T;
 }
