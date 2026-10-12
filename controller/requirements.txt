@@ -1,0 +1,10 @@
+fastapi
+httpx
+uvicorn
+openpyxl
+pillow
+pypdf
+pymupdf
+python-multipart
+pytest
+pytest-asyncio
