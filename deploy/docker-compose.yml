@@ -1,0 +1,104 @@
+# Local run: gateway + controller + view + work mount.
+#
+# Usage (fresh checkout):
+#   cd deploy && docker compose up --build
+#   # view:        http://127.0.0.1:8791/  (chat + setup view)
+#   # controller:  http://127.0.0.1:8790/api/health
+#   # gateway:     http://127.0.0.1:8787/mcp (bearer enforced)
+#   # stdio gateway instead: docker compose run --rm gateway --transport stdio --open-auth
+#
+# Tokens: the gateway image ships NO tokens. Mint per-session tokens by
+# exec'ing a Python one-liner against the running container, or mount a
+# tokens file (see `deploy/tokens.example.json`). Never bake tokens into
+# images. Controller settings (custom endpoints + keys) live in the
+# settings volume (JSON file), never in images or logs.
+#
+# Without docker: run natively (3 terminals from the repo root):
+#   python3 -m gateway.main --transport http --port 8787   # needs CRAFTER_DEV_TOKEN
+#   python3 -m uvicorn controller.service:app --port 8790
+#   npm run dev --prefix view -- --port 8791
+
+name: crafters
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: crafters/gateway:local
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # Session work dir — per-session roots confine agents under /work.
+      - crafter-work:/work:rw
+    environment:
+      CRAFTER_WORK_DIR: /work
+      # CRAFTER_TOKENS_FILE: /run/secrets/crafter_tokens.json
+    # secrets:
+    #   - crafter_tokens
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # MCP answers 4xx without a bearer/session (protocol layer) — any HTTP
+      # response (even 400/401) proves the server is up; only connection
+      # failure or 5xx is unhealthy.
+      test: ["CMD", "python", "-c", "import urllib.request,urllib.error,sys; u='http://127.0.0.1:8787/mcp';\ntry:\n r=urllib.request.urlopen(u,data=b'{}',timeout=4);print(r.status)\nexcept urllib.error.HTTPError as e:\n print(e.code);sys.exit(0 if e.code<500 else 1)\nexcept Exception as e:\n print(e);sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  controller:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.controller
+    image: crafters/controller:local
+    ports:
+      - "127.0.0.1:8790:8790"
+    volumes:
+      - crafter-work:/work:rw
+      - crafter-settings:/settings:rw
+    environment:
+      CRAFTER_WORK_DIR: /work
+      CRAFTER_SETTINGS_FILE: /settings/settings.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  view:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.view
+    image: crafters/view:local
+    ports:
+      - "127.0.0.1:8791:80"
+    depends_on:
+      controller:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  crafter-work:
+  crafter-settings:
+
+# secrets:
+#   crafter_tokens:
+#     file: ./tokens.json

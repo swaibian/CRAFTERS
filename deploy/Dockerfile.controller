@@ -1,0 +1,29 @@
+# Crafter controller image: FastAPI service + local doc adapters.
+#
+# No secrets baked in: settings (custom endpoints + keys) arrive via the
+# /settings volume (CRAFTER_SETTINGS_FILE) at runtime. The image carries
+# only code + adapter deps (openpyxl, Pillow, pypdf, pymupdf).
+
+FROM python:3.12-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY controller/requirements.txt ./controller/requirements.txt
+RUN pip install --no-cache-dir -r controller/requirements.txt
+
+COPY controller/ ./controller/
+COPY Scaico_Teams/ ./Scaico_Teams/
+
+RUN useradd --create-home --uid 10002 crafter \
+    && mkdir -p /work /settings \
+    && chown crafter:crafter /work /settings
+USER crafter
+
+EXPOSE 8790
+
+ENTRYPOINT ["python", "-m", "uvicorn", "controller.service:app"]
+CMD ["--host", "0.0.0.0", "--port", "8790"]
